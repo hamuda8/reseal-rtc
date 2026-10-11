@@ -9,8 +9,10 @@ pub const Address = net.Address;
 pub const Socket = net.Socket;
 
 pub const stun = @import("ice/stun.zig");
+pub const srtp = @import("media/srtp.zig");
 
 test {
     _ = net;
     _ = stun;
+    _ = srtp;
 }

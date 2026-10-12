@@ -12,6 +12,7 @@ pub const stun = @import("ice/stun.zig");
 pub const candidate = @import("ice/candidate.zig");
 pub const TurnClient = @import("ice/turn.zig");
 pub const IceAgent = @import("ice/Agent.zig");
+pub const sdp = @import("sdp/sdp.zig");
 pub const srtp = @import("media/srtp.zig");
 pub const dtls_prf = @import("dtls/prf.zig");
 pub const dtls_cert = @import("dtls/cert.zig");
@@ -23,6 +24,7 @@ test {
     _ = candidate;
     _ = TurnClient;
     _ = IceAgent;
+    _ = sdp;
     _ = srtp;
     _ = dtls_prf;
     _ = dtls_cert;

@@ -1,0 +1,81 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>reseal-rtc interop</title></head>
+<body>
+<video id="v" autoplay muted playsinline width="320" height="240"></video>
+<script>
+// Browser side of the interop test. mode=answer: the browser offers and reseal-rtc answers.
+// mode=offer: reseal-rtc offers and the browser answers. Results land in window.result.
+const mode = new URLSearchParams(location.search).get('mode') || 'answer';
+window.result = null;
+window.log = [];
+const log = (m) => window.log.push(String(m));
+
+function waitGathering(pc) {
+  if (pc.iceGatheringState === 'complete') return Promise.resolve();
+  return new Promise((resolve) => {
+    pc.addEventListener('icegatheringstatechange', () => { if (pc.iceGatheringState === 'complete') resolve(); });
+    setTimeout(resolve, 3000);
+  });
+}
+
+async function stats(pc) {
+  const r = { ice: pc.iceConnectionState, conn: pc.connectionState, log: window.log };
+  (await pc.getStats()).forEach((s) => {
+    if (s.type === 'transport') r.transport = { dtlsState: s.dtlsState, dtlsRole: s.dtlsRole, srtpCipher: s.srtpCipher, dtlsCipher: s.dtlsCipher, tlsVersion: s.tlsVersion };
+    if (s.type === 'inbound-rtp' && s.kind === 'audio') r.audio_in = { packetsReceived: s.packetsReceived, packetsLost: s.packetsLost, bytesReceived: s.bytesReceived, totalSamplesReceived: s.totalSamplesReceived };
+    if (s.type === 'inbound-rtp' && s.kind === 'video') r.video_in = { packetsReceived: s.packetsReceived, framesReceived: s.framesReceived, framesDecoded: s.framesDecoded, keyFramesDecoded: s.keyFramesDecoded, frameWidth: s.frameWidth, frameHeight: s.frameHeight, nackCount: s.nackCount, pliCount: s.pliCount, decoderImplementation: s.decoderImplementation };
+    if (s.type === 'outbound-rtp' && s.kind === 'audio') r.audio_out = { packetsSent: s.packetsSent };
+    if (s.type === 'outbound-rtp' && s.kind === 'video') r.video_out = { packetsSent: s.packetsSent, framesEncoded: s.framesEncoded, encoderImplementation: s.encoderImplementation, frameWidth: s.frameWidth };
+    if (s.type === 'codec') (r.codecs ||= []).push(s.mimeType + ' ' + (s.sdpFmtpLine || ''));
+    if (s.type === 'candidate-pair' && s.nominated) r.pair = { state: s.state, bytesSent: s.bytesSent, bytesReceived: s.bytesReceived };
+  });
+  return r;
+}
+
+async function main() {
+  const pc = new RTCPeerConnection({ bundlePolicy: 'max-bundle' });
+  window.pc = pc;
+  pc.ontrack = (e) => {
+    log('track ' + e.track.kind);
+    if (e.track.kind === 'video') {
+      const v = document.getElementById('v');
+      v.srcObject = e.streams[0] || new MediaStream([e.track]);
+      v.play().catch((err) => log('play ' + err));
+    }
+  };
+  pc.oniceconnectionstatechange = () => log('ice ' + pc.iceConnectionState);
+  pc.onconnectionstatechange = () => log('conn ' + pc.connectionState);
+  const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: { width: 320, height: 240, frameRate: 15 } });
+  if (mode === 'answer') {
+    for (const t of stream.getTracks()) pc.addTrack(t, stream);
+    await pc.setLocalDescription(await pc.createOffer());
+    await waitGathering(pc);
+    const answer = await (await fetch('/offer', { method: 'POST', body: pc.localDescription.sdp })).text();
+    window.answerSdp = answer;
+    await pc.setRemoteDescription({ type: 'answer', sdp: answer });
+  } else {
+    const offer = await (await fetch('/offer')).text();
+    await pc.setRemoteDescription({ type: 'offer', sdp: offer });
+    for (const t of stream.getTracks()) pc.addTrack(t, stream);
+    await pc.setLocalDescription(await pc.createAnswer());
+    await waitGathering(pc);
+    await fetch('/answer', { method: 'POST', body: pc.localDescription.sdp });
+  }
+  log('signalling done');
+  const t0 = Date.now();
+  while (Date.now() - t0 < 25000) {
+    await new Promise((r) => setTimeout(r, 1000));
+    const s = await stats(pc);
+    window.result = s;
+    const ok = s.video_in && s.video_in.framesDecoded > 20 && s.audio_in && s.audio_in.packetsReceived > 100 &&
+      s.audio_out && s.audio_out.packetsSent > 100 && s.video_out && s.video_out.packetsSent > 50;
+    if (ok && Date.now() - t0 > 6000) break;
+  }
+  window.result.done = true;
+}
+
+main().catch((e) => { window.result = { error: String((e && e.stack) || e), log: window.log, done: true }; });
+</script>
+</body>
+</html>

@@ -12,6 +12,7 @@ pub const stun = @import("ice/stun.zig");
 pub const srtp = @import("media/srtp.zig");
 pub const dtls_prf = @import("dtls/prf.zig");
 pub const dtls_cert = @import("dtls/cert.zig");
+pub const DtlsConn = @import("dtls/Conn.zig");
 
 test {
     _ = net;
@@ -19,4 +20,8 @@ test {
     _ = srtp;
     _ = dtls_prf;
     _ = dtls_cert;
+    _ = DtlsConn;
+    _ = @import("dtls/bytes.zig");
+    _ = @import("dtls/record.zig");
+    _ = @import("dtls/handshake.zig");
 }

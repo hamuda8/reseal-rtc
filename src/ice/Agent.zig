@@ -310,6 +310,11 @@ fn localForBase(a: *const Agent, base: Base) ?u16 {
     return null;
 }
 
+/// Offerer controls, answerer is controlled (RFC 8445 6.1.1); set before checks start.
+pub fn setRole(a: *Agent, role: Role) void {
+    a.switchRole(role);
+}
+
 fn switchRole(a: *Agent, role: Role) void {
     a.role = role;
     for (a.pairs.items) |*p| p.priority = a.pairPriority(p.local, p.remote);

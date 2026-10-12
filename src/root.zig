@@ -10,9 +10,13 @@ pub const Socket = net.Socket;
 
 pub const stun = @import("ice/stun.zig");
 pub const srtp = @import("media/srtp.zig");
+pub const dtls_prf = @import("dtls/prf.zig");
+pub const dtls_cert = @import("dtls/cert.zig");
 
 test {
     _ = net;
     _ = stun;
     _ = srtp;
+    _ = dtls_prf;
+    _ = dtls_cert;
 }

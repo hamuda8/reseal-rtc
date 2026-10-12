@@ -16,6 +16,7 @@ pub const sdp = @import("sdp/sdp.zig");
 pub const PeerTransport = @import("transport/PeerTransport.zig");
 pub const peer = @import("peer.zig");
 pub const PeerConnection = peer.PeerConnection;
+pub const driver = @import("driver.zig");
 pub const srtp = @import("media/srtp.zig");
 pub const rtp = @import("media/rtp.zig");
 pub const rtcp = @import("media/rtcp.zig");
@@ -35,6 +36,7 @@ test {
     _ = sdp;
     _ = PeerTransport;
     _ = peer;
+    _ = driver;
     _ = @import("tests/loopback.zig");
     _ = srtp;
     _ = rtp;

@@ -398,7 +398,11 @@ pub const PeerConnection = struct {
         try pc.transport.ice.setRemoteCredentials(ufrag, pwd);
         for (s.media) |*m| {
             var it = m.attrs("candidate");
-            while (it.next()) |c| pc.addIceCandidate(c) catch {};
+            while (it.next()) |c| {
+                var line_buf: [512]u8 = undefined;
+                const line = std.fmt.bufPrint(&line_buf, "candidate:{s}", .{c}) catch continue;
+                pc.addIceCandidate(line) catch {};
+            }
         }
         if (kind == .answer) {
             const setup = first.attr("setup") orelse "active";

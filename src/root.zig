@@ -9,6 +9,8 @@ pub const Address = net.Address;
 pub const Socket = net.Socket;
 
 pub const stun = @import("ice/stun.zig");
+pub const candidate = @import("ice/candidate.zig");
+pub const TurnClient = @import("ice/turn.zig");
 pub const srtp = @import("media/srtp.zig");
 pub const dtls_prf = @import("dtls/prf.zig");
 pub const dtls_cert = @import("dtls/cert.zig");
@@ -17,6 +19,8 @@ pub const DtlsConn = @import("dtls/Conn.zig");
 test {
     _ = net;
     _ = stun;
+    _ = candidate;
+    _ = TurnClient;
     _ = srtp;
     _ = dtls_prf;
     _ = dtls_cert;

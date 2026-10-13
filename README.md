@@ -11,7 +11,31 @@ It has been run against Chrome 154 (headless, fake camera and microphone) in bot
 ICE connected, DTLS handshake done, SRTP both ways, and each side decoded the other's audio
 and video (see "Proof" below).
 
-## Using it
+## In a zui app (Reseal on Android and iOS)
+
+zig-core's zui has the calls API (`fx.openMedia`, `fx.openPeer`, `ui.video`...). On the web it
+runs on the browser's WebRTC; on the phones zui does capture, codecs and drawing itself and takes
+the connection from an engine the app supplies. reseal-rtc is that engine:
+
+```zig
+// client root
+pub const rtc = @import("reseal_rtc").zui_engine;
+pub const panic = zui.panic;
+```
+
+```zig
+// build.zig: pass the module to the client
+.client_imports = &.{.{ .name = "reseal_rtc", .module = b.dependency("reseal_rtc", .{}).module("reseal_rtc") }},
+```
+
+`src/zui_engine.zig` speaks the web host's signals exactly
+(`{"description":{"type","sdp"}}`, `{"candidate":{"candidate","sdpMid","sdpMLineIndex","usernameFragment"}}`),
+offers as soon as a connection opens, resolves glare like the web host (perfect negotiation: the
+polite side rolls back its offer, the impolite side ignores the other's), and restarts ICE when a
+connection fails, so phones and browsers call each other. On the phones it runs on BSD sockets
+and pthreads (`src/posix.zig`), not std.Io.Threaded (see Platforms).
+
+## Using it directly
 
 ```zig
 // build.zig.zon: .reseal_rtc = .{ .url = "git+https://github.com/hamuda8/reseal-rtc#<commit>", .hash = "..." }
@@ -141,11 +165,16 @@ sockets per PeerConnection (a 10-person mesh is 9 PeerConnections, 9 sockets).
 
 ### Platforms
 
-Compiles for aarch64-linux-android, aarch64-macos, x86_64-linux and Windows as is. For
-aarch64-ios, Zig 0.17's default panic handler pulls in `std.Io.Threaded` process-spawning code
-that does not compile for iOS (a std issue, independent of this library); an iOS app must
-declare its own `pub const panic` in its root file, which iOS apps do anyway. With that, the
-whole module, `driver` included, compiles for iOS in Debug and ReleaseFast.
+Compiles for aarch64-linux-android, aarch64-ios, aarch64-macos, x86_64-linux and Windows.
+
+Zig 0.17's `std.Io.Threaded` does not compile for iOS (its process-spawning code), and
+anything that can reach `std.debug`'s default Io drags it in: the default panic handler,
+`std.Thread.spawn`'s error path, `std.heap.smp_allocator`. So on iOS:
+* declare a panic handler in the app root (`pub const panic = zui.panic;` in zui apps);
+* use `zui_engine` / `posix.zig` (pthreads, BSD sockets, libc malloc), not `driver.zig`.
+
+Cancelling std.Io tasks interrupts blocked calls with SIGIO, which is fatal inside an Android
+app process; `driver.Driver` therefore stops its tasks cooperatively.
 
 ### Signalling with Reseal
 
@@ -155,7 +184,9 @@ Reseal's `call.signal` messages carry `{ description: { type, sdp }, sig }` and
 `{ candidate: line, sdpMid: "0", sdpMLineIndex: 0 }` (with BUNDLE every m-line shares the
 transport). The SDP signature scheme (`reseal/call/v1|...`) is unchanged: sign and verify
 the SDP text as the web client does. Renegotiation offers (perfect negotiation adds a video
-track mid-call) are accepted; ICE restart is not implemented yet.
+track mid-call), offer rollback (`rollback`) and ICE restarts in both directions (`restartIce`,
+and new credentials in a remote offer) are supported. Video carries its rotation in the
+urn:3gpp:video-orientation extension (`setVideoRotation`; received as `video_frame.rotation`).
 
 ## Layers
 
@@ -193,12 +224,12 @@ tools/interop/       browser interop harness (not part of the module)
 | Layer | Implemented | Not yet |
 |---|---|---|
 | STUN | All RFC 8489 framing used by ICE/TURN, MESSAGE-INTEGRITY (HMAC-SHA1), FINGERPRINT | MESSAGE-INTEGRITY-SHA256, SASLprep |
-| TURN | UDP allocations with long-term credentials (401/438 nonce handling), Refresh, CreatePermission, ChannelBind, Send/Data indications, ChannelData, release | TURN over TCP/TLS (`turns:`), IPv6 relays, mobility |
-| ICE | Full agent: host/srflx/relay gathering, trickle in/out, pairs and priorities, paced checks with retransmission, triggered checks, peer-reflexive candidates, role-conflict resolution (487), regular nomination when controlling, USE-CANDIDATE when controlled, consent freshness with disconnected/failed states | ICE restart, ICE-lite mode, mDNS resolution of `.local` candidates (handled through peer-reflexive learning), TCP candidates, frozen/foundation scheduling (one stream needs none) |
+| TURN | UDP allocations with long-term credentials (401/438 nonce handling), Refresh, CreatePermission, ChannelBind, Send/Data indications, ChannelData, release | TURN over TCP/TLS (`turns:`, port 443: the next transport item), IPv6 relays, mobility |
+| ICE | Full agent: host/srflx/relay gathering, trickle in/out, pairs and priorities, paced checks with retransmission, triggered checks, peer-reflexive candidates, role-conflict resolution (487), regular nomination when controlling, USE-CANDIDATE when controlled, consent freshness with disconnected/failed states, ICE restart (media stays on the old path until a new pair is selected) | ICE-lite mode, mDNS resolution of `.local` candidates (handled through peer-reflexive learning), TCP candidates, frozen/foundation scheduling (one stream needs none) |
 | DTLS | 1.2 client and server, ECDHE (P-256 or X25519) + ECDSA P-256, AES-128-GCM, mutual certificates checked against SDP fingerprints, use_srtp, extended master secret, renegotiation_info, HelloVerifyRequest as client, fragmentation and reassembly, flight retransmission with backoff, replay window, alerts, exporter | DTLS 1.3, server cookies (HelloVerifyRequest as server), resumption, RSA certificates |
 | SRTP | Both profiles browsers use, ROC tracking, 128-entry replay window, SRTCP | MKI, AES-256 profiles, key rollover |
 | RTP/RTCP | SR/RR with loss and jitter, SDES CNAME, BYE, NACK both ways (retransmit from a 512-packet history), PLI/FIR both ways, REMB both ways | transport-cc, RTX (retransmission uses the original SSRC, as without `a=rtpmap rtx`), RED/FEC, simulcast, header extensions on send |
-| Media | Opus and H.264 packetizers/depacketizer, jitter buffer with frame assembly and loss skipping | bandwidth estimation and rate control (app picks the bitrate; REMB is reported), audio level, VP8/VP9/AV1 |
+| Media | Opus and H.264 packetizers/depacketizer, jitter buffer with frame assembly and loss skipping, video orientation (CVO) | bandwidth estimation and rate control (app picks the bitrate; REMB is reported; adaptation from REMB and loss is planned), transport-cc, audio level, VP8/VP9/AV1 |
 | SDP | Lossless parse/serialise (byte-exact round trip of Chrome SDP), BUNDLE, rtcp-mux, ICE/DTLS attributes, codecs, fmtp, rtcp-fb, extmap, ssrc; answers mirror the offer (unsupported m-lines rejected with port 0) | generating `m=application` |
 | Data channels | Plan in `src/data/data.zig` | Everything |
 

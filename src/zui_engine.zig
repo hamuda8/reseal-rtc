@@ -83,6 +83,9 @@ pub const Peer = struct {
     held: std.ArrayList([]u8) = .empty,
     ignore_offer: bool = false,
     restart_wanted: bool = false,
+    /// Video was handed to us but the session has none: renegotiate once to add it.
+    video_wanted: bool = false,
+    video_offered: bool = false,
     connection: peer_mod.ConnectionState = .new,
     ice: peer_mod.IceState = .new,
     reported: []const u8 = "",
@@ -215,6 +218,14 @@ pub fn sendVideo(p: *Peer, annexb: []const u8, timestamp_90k: u32, rotation: u16
     defer p.driver.unlock();
     p.pc.setVideoRotation(rotation);
     p.pc.debug_drop_video_percent = test_drop_video_percent;
+    if (!p.pc.canSendVideo()) {
+        // A call that began as voice: add video by renegotiating, like addTrack in a browser.
+        if (!p.video_offered) {
+            p.video_wanted = true;
+            onTick(p);
+        }
+        return;
+    }
     p.pc.sendVideo(annexb, timestamp_90k) catch {};
 }
 
@@ -270,6 +281,12 @@ fn reportTracks(p: *Peer) void {
 
 fn onTick(ctx: *anyopaque) void {
     const p: *Peer = @ptrCast(@alignCast(ctx));
+    if (p.video_wanted and p.pc.isStable() and !p.restart_wanted) {
+        p.video_wanted = false;
+        p.video_offered = true;
+        offer(p);
+        return;
+    }
     // Restart ICE once the connection failed, as the web host does (pc.restartIce()). If an
     // offer is in flight, the restart waits for it to settle.
     if (p.restart_wanted and p.pc.isStable()) {

@@ -412,12 +412,18 @@ pub const PeerConnection = struct {
             pc.tracks[1].cvo_id = cvo_default_id;
             pc.tracks[1].abs_id = abs_send_time_default_id;
         } else {
-            // Re-offer: same m-lines and mids; ICE and DTLS roles stay as negotiated.
+            // Re-offer: same m-lines and mids; ICE and DTLS roles stay as negotiated. A kind
+            // missing from the session (a call that began as voice) gets its m-line now, as a
+            // browser's addTrack would.
             pc.session_version += 1;
-            for (&pc.tracks) |*t| if (t.accepted) {
-                t.send = true;
-                t.recv = true;
-            };
+            for (&pc.tracks, 0..) |*t, i| {
+                const enabled = if (t.kind == .audio) pc.config.audio else pc.config.video;
+                if (!t.accepted and enabled) pc.addTrackLine(@intCast(i));
+                if (t.accepted) {
+                    t.send = true;
+                    t.recv = true;
+                }
+            }
         }
         if (pc.restart_pending) {
             pc.restart_pending = false;
@@ -666,6 +672,38 @@ pub const PeerConnection = struct {
             }
         }
         return best;
+    }
+
+    /// Puts track `i` into the session: its rejected m-line again, or a new one with a fresh mid.
+    fn addTrackLine(pc: *PeerConnection, i: u1) void {
+        const t = &pc.tracks[i];
+        if (t.mid_len == 0) {
+            if (pc.mline_count == max_mlines) return;
+            var n: u32 = 0;
+            var buf: [12]u8 = undefined;
+            const mid = while (true) : (n += 1) {
+                const text = std.fmt.bufPrint(&buf, "{d}", .{n}) catch return;
+                const used = for (pc.mlines[0..pc.mline_count]) |*ml| {
+                    const m = if (ml.track) |k| pc.tracks[k].midText() else ml.mid.text();
+                    if (std.mem.eql(u8, m, text)) break true;
+                } else false;
+                if (!used) break text;
+            };
+            t.setMid(mid);
+            pc.mlines[pc.mline_count] = .{ .track = i };
+            pc.mline_count += 1;
+        }
+        t.accepted = true;
+        t.pt = if (t.kind == .audio) opus_pt_default else h264_pt_default;
+        if (t.kind == .video) {
+            t.cvo_id = cvo_default_id;
+            t.abs_id = abs_send_time_default_id;
+        }
+    }
+
+    /// True when our video can go out (negotiated, and the peer accepts it).
+    pub fn canSendVideo(pc: *const PeerConnection) bool {
+        return pc.tracks[1].accepted and pc.tracks[1].send;
     }
 
     /// Undoes our pending offer (perfect negotiation: the polite side gives way when both

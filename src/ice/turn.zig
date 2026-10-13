@@ -68,6 +68,8 @@ channels: std.ArrayList(Channel) = .empty,
 next_channel: u16 = 0x4000,
 txs: std.ArrayList(Tx) = .empty,
 now: u64 = 0,
+/// See `setStream`.
+stream: bool = false,
 
 const Client = @This();
 
@@ -75,6 +77,12 @@ pub fn init(gpa: std.mem.Allocator, io: std.Io, out: Output, socket: u8, server:
     const u = try gpa.dupe(u8, username);
     errdefer gpa.free(u);
     return .{ .gpa = gpa, .io = io, .out = out, .server = server, .socket = socket, .username = u, .password = try gpa.dupe(u8, password) };
+}
+
+/// The connection to the server is a stream (TCP/TLS): ChannelData is padded to 4 bytes so
+/// the receiver can find the next message.
+pub fn setStream(c: *Client) void {
+    c.stream = true;
 }
 
 pub fn deinit(c: *Client) void {
@@ -231,7 +239,14 @@ pub fn send(c: *Client, peer: Address, payload: []const u8) void {
             std.mem.writeInt(u16, buf[0..2], ch.number, .big);
             std.mem.writeInt(u16, buf[2..4], @intCast(payload.len), .big);
             @memcpy(buf[4..][0..payload.len], payload);
-            c.out.send(c.out.ctx, c.socket, c.server, buf[0 .. 4 + payload.len]);
+            var total = 4 + payload.len;
+            if (c.stream) {
+                const padded = std.mem.alignForward(usize, total, 4);
+                if (padded > buf.len) return;
+                @memset(buf[total..padded], 0);
+                total = padded;
+            }
+            c.out.send(c.out.ctx, c.socket, c.server, buf[0..total]);
             return;
         }
     } else if (c.next_channel <= 0x4FFF) {
@@ -463,4 +478,35 @@ test "TURN allocate with long-term auth, permissions, send indication, channel d
     }
     try testing.expectEqualStrings("reply", ev.items[0].data.payload);
     try testing.expect(ev.items[0].data.peer.eql(peer));
+}
+
+test "ChannelData over a stream is padded to 4 bytes" {
+    const gpa = testing.allocator;
+    var server: FakeServer = .{ .gpa = gpa, .key = stun.longTermKey("u", "reseal", "p") };
+    defer server.deinit();
+    var c = try Client.init(gpa, testing.io, .{ .ctx = &server, .send = FakeServer.sendFn }, 0, server.address, "u", "p");
+    defer c.deinit();
+    c.setStream();
+    c.start(0);
+    for (0..2) |_| {
+        var ev = server.deliver(&c);
+        ev.deinit(gpa);
+    }
+    const peer = Address.ip4(.{ 203, 0, 113, 9 }, 5000);
+    c.send(peer, "first");
+    var ev = server.deliver(&c);
+    ev.deinit(gpa);
+    // Capture what the client writes now: ChannelData with 5 payload bytes padded to 12.
+    const Capture = struct {
+        var last: [64]u8 = undefined;
+        var len: usize = 0;
+        fn send(_: *anyopaque, _: u8, _: Address, data: []const u8) void {
+            @memcpy(last[0..data.len], data);
+            len = data.len;
+        }
+    };
+    c.out = .{ .ctx = &server, .send = Capture.send };
+    c.send(peer, "abcde");
+    try testing.expectEqual(@as(usize, 12), Capture.len);
+    try testing.expectEqual(@as(u16, 5), std.mem.readInt(u16, Capture.last[2..4], .big));
 }

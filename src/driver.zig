@@ -81,7 +81,9 @@ pub fn resolveIceServers(io: Io, gpa: std.mem.Allocator, list: []const IceServer
         errdefer gpa.free(user);
         const pass = try gpa.dupe(u8, if (turn) entry.credential else "");
         errdefer gpa.free(pass);
-        try out.append(gpa, .{ .address = address, .turn = turn, .username = user, .password = pass });
+        const name = try gpa.dupe(u8, host);
+        errdefer gpa.free(name);
+        try out.append(gpa, .{ .address = address, .turn = turn, .username = user, .password = pass, .host = name });
     };
     return out.toOwnedSlice(gpa);
 }
@@ -90,6 +92,7 @@ pub fn freeServers(gpa: std.mem.Allocator, servers: []const IceAgent.Server) voi
     for (servers) |s| {
         gpa.free(s.username);
         gpa.free(s.password);
+        gpa.free(s.host);
     }
     gpa.free(servers);
 }

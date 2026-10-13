@@ -57,6 +57,8 @@ pub const Sink = struct {
 
 /// Tests only: drop this percentage of outgoing video packets, to watch adaptation work.
 pub var test_drop_video_percent: u8 = 0;
+/// Tests only: iceTransportPolicy "relay" for the next connections (only TURN candidates).
+pub var test_relay_only: bool = false;
 
 pub const Options = struct {
     /// RTCPeerConnection's iceServers JSON: [{"urls":[...],"username":"","credential":""}].
@@ -76,6 +78,9 @@ pub const Peer = struct {
     pc: *PeerConnection = undefined,
     udp: [max_sockets]Udp = undefined,
     udp_count: usize = 0,
+    /// TURN over TCP/TLS connections (phones only).
+    streams: [max_sockets]*if (use_posix) posix.StreamConn else void = undefined,
+    stream_count: usize = 0,
     driver: Driver = undefined,
     servers: []IceAgent.Server = &.{},
     /// Inside a negotiation call: candidates wait so they follow the description they belong to.
@@ -140,16 +145,27 @@ pub fn open(gpa: std.mem.Allocator, opts: Options, sink: Sink) !*Peer {
     p.servers = resolveServers(io, gpa, opts.ice_servers) catch &.{};
     errdefer driver.freeServers(gpa, p.servers);
 
-    var sockets: [max_sockets]net.Socket = undefined;
+    var sockets: [2 * max_sockets]net.Socket = undefined;
     for (p.udp[0..p.udp_count], 0..) |*u, i| sockets[i] = u.socket();
+    // TURN over TCP or TLS: a stream connection per such server, after the UDP sockets.
+    if (use_posix) for (p.servers) |srv| {
+        if (!srv.turn or srv.transport == .udp or p.stream_count == max_sockets) continue;
+        const sc = try posix.StreamConn.create(gpa, srv.address, srv.host, srv.transport == .tls);
+        p.streams[p.stream_count] = sc;
+        sockets[p.udp_count + p.stream_count] = sc.socket();
+        p.stream_count += 1;
+    };
+    errdefer if (use_posix) for (p.streams[0..p.stream_count]) |sc| sc.destroy();
     p.pc = try PeerConnection.create(gpa, io, .{
-        .sockets = sockets[0..p.udp_count],
+        .sockets = sockets[0 .. p.udp_count + p.stream_count],
         .servers = p.servers,
+        .ice_relay_only = test_relay_only,
         .handler = .{ .ctx = p, .onEvent = onEvent },
     });
     errdefer p.pc.destroy();
     p.driver = if (use_posix) .init(p.pc, p.udp[0..p.udp_count]) else .init(io, p.pc, p.udp[0..p.udp_count]);
     p.driver.on_tick = .{ .ctx = p, .f = onTick };
+    if (use_posix) p.driver.streams = p.streams[0..p.stream_count];
 
     // Like the browser's negotiationneeded: offer right away.
     offer(p);
@@ -162,6 +178,7 @@ pub fn close(p: *Peer) void {
     p.driver.stop();
     p.pc.close();
     p.pc.destroy();
+    if (use_posix) for (p.streams[0..p.stream_count]) |sc| sc.destroy();
     for (p.udp[0..p.udp_count]) |*u| u.close();
     driver.freeServers(p.gpa, p.servers);
     for (p.held.items) |h| p.gpa.free(h);

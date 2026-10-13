@@ -164,6 +164,8 @@ pub fn resolve(host: []const u8, port: u16) !net.Address {
 pub const Driver = struct {
     pc: *PeerConnection,
     sockets: []Udp,
+    /// TURN stream connections; they are the PeerConnection's sockets after the UDP ones.
+    streams: []*StreamConn = &.{},
     mutex: Mutex = .{},
     /// pthreads directly: std.Thread's error path reaches std.debug, whose default Io does not
     /// compile for iOS.
@@ -197,6 +199,22 @@ pub const Driver = struct {
         return null;
     }
 
+    fn streamEntry(arg: ?*anyopaque) callconv(.c) ?*anyopaque {
+        const x: *Ctx = @ptrCast(@alignCast(arg.?));
+        x.d.streams[x.index - x.d.sockets.len].run(x, deliverStream);
+        return null;
+    }
+
+    fn deliverStream(ctx: *anyopaque, msg: []const u8) void {
+        const x: *Ctx = @ptrCast(@alignCast(ctx));
+        const d = x.d;
+        if (d.stopping.load(.acquire)) return;
+        d.mutex.lock();
+        defer d.mutex.unlock();
+        d.pc.receive(x.index, d.streams[x.index - d.sockets.len].server, msg, nowMs());
+        if (d.on_tick) |h| h.f(h.ctx);
+    }
+
     fn timerEntry(arg: ?*anyopaque) callconv(.c) ?*anyopaque {
         const x: *Ctx = @ptrCast(@alignCast(arg.?));
         timerLoop(x.d);
@@ -208,7 +226,9 @@ pub const Driver = struct {
     }
 
     pub fn start(d: *Driver) !void {
-        for (0..@min(d.sockets.len, d.threads.len - 1)) |i| try d.spawn(i, receiveEntry);
+        if (d.sockets.len + d.streams.len > d.threads.len - 1) return error.TooManySockets;
+        for (0..d.sockets.len) |i| try d.spawn(i, receiveEntry);
+        for (0..d.streams.len) |i| try d.spawn(d.sockets.len + i, streamEntry);
         try d.spawn(d.threads.len - 1, timerEntry);
     }
 
@@ -220,6 +240,7 @@ pub const Driver = struct {
             if (to.isUnspecified()) to = net.Address.ip4(.{ 127, 0, 0, 1 }, to.port);
             u.send(to, &.{0});
         }
+        for (d.streams) |sc| sc.close();
         for (&d.threads) |*t| if (t.*) |th| {
             _ = c.pthread_join(th, null);
             t.* = null;
@@ -262,20 +283,23 @@ pub const Driver = struct {
     }
 };
 
-/// iceServers urls (stun:/turn:, UDP only) to servers, resolved with getaddrinfo.
+/// iceServers urls to servers, resolved with getaddrinfo: stun:, turn: (UDP),
+/// turn:...?transport=tcp (TCP) and turns: (TLS, port 5349 unless given).
 pub fn resolveIceServers(gpa: std.mem.Allocator, list: []const @import("driver.zig").IceServerUrls) ![]IceAgent.Server {
     var out: std.ArrayList(IceAgent.Server) = .empty;
     errdefer @import("driver.zig").freeServers(gpa, out.items);
     for (list) |entry| for (entry.urls) |url| {
-        const turn = std.mem.startsWith(u8, url, "turn:");
+        const tls = std.mem.startsWith(u8, url, "turns:");
+        const turn = tls or std.mem.startsWith(u8, url, "turn:");
         if (!turn and !std.mem.startsWith(u8, url, "stun:")) continue;
-        var rest = url[5..];
+        var rest = url[if (tls) 6 else 5..];
+        var transport: IceAgent.Server.Transport = if (tls) .tls else .udp;
         if (std.mem.indexOfScalar(u8, rest, '?')) |q| {
-            if (std.mem.indexOf(u8, rest[q..], "transport=tcp") != null) continue;
+            if (!tls and std.mem.indexOf(u8, rest[q..], "transport=tcp") != null) transport = .tcp;
             rest = rest[0..q];
         }
         var host = rest;
-        var port: u16 = 3478;
+        var port: u16 = if (tls) 5349 else 3478;
         if (std.mem.lastIndexOfScalar(u8, rest, ':')) |i| {
             host = rest[0..i];
             port = std.fmt.parseInt(u16, rest[i + 1 ..], 10) catch 3478;
@@ -285,7 +309,186 @@ pub fn resolveIceServers(gpa: std.mem.Allocator, list: []const @import("driver.z
         errdefer gpa.free(user);
         const pass = try gpa.dupe(u8, if (turn) entry.credential else "");
         errdefer gpa.free(pass);
-        try out.append(gpa, .{ .address = address, .turn = turn, .username = user, .password = pass });
+        const name = try gpa.dupe(u8, host);
+        errdefer gpa.free(name);
+        try out.append(gpa, .{ .address = address, .turn = turn, .username = user, .password = pass, .transport = transport, .host = name });
     };
     return out.toOwnedSlice(gpa);
 }
+
+// ---- TURN over TCP and TLS ------------------------------------------------------------------
+
+/// A stream connection to one TURN server (TCP, or TLS for "turns:"), used as a `net.Socket`
+/// with `remote` set. It connects on its own thread (opening a call never blocks on it); what
+/// is sent before then waits. Received data is cut into whole TURN messages (STUN by its header
+/// length, ChannelData by its length padded to 4, RFC 8656 §12.5).
+///
+/// TLS: std's client, with the server name sent (SNI) but the certificate chain not checked
+/// against a CA store: on the phones std has no store it can use without std.Io.Threaded. The
+/// calls stay safe: media is end-to-end DTLS-SRTP pinned by the SDP fingerprints, and TURN
+/// requests are authenticated with HMAC; what is exposed is metadata to whoever intercepts
+/// the TURN connection.
+pub const StreamConn = struct {
+    const tls = std.crypto.tls;
+
+    gpa: std.mem.Allocator,
+    server: net.Address,
+    host: []u8,
+    use_tls: bool,
+    fd: c.fd_t = -1,
+    state: std.atomic.Value(State) = .init(.connecting),
+    write_lock: Mutex = .{},
+    pending: std.ArrayList(u8) = .empty,
+
+    raw_reader: std.Io.Reader = undefined,
+    raw_writer: std.Io.Writer = undefined,
+    raw_read_buf: [tls.Client.min_buffer_len]u8 = undefined,
+    raw_write_buf: [tls.Client.min_buffer_len]u8 = undefined,
+    client: tls.Client = undefined,
+    tls_read_buf: [tls.Client.min_buffer_len]u8 = undefined,
+    tls_write_buf: [tls.Client.min_buffer_len]u8 = undefined,
+
+    pub const State = enum(u8) { connecting, open, failed, closed };
+
+    const Mutex = struct {
+        m: c.pthread_mutex_t = .{},
+        fn lock(x: *Mutex) void {
+            _ = c.pthread_mutex_lock(&x.m);
+        }
+        fn unlock(x: *Mutex) void {
+            _ = c.pthread_mutex_unlock(&x.m);
+        }
+    };
+
+    pub fn create(gpa: std.mem.Allocator, server: net.Address, host: []const u8, use_tls: bool) !*StreamConn {
+        const sc = try gpa.create(StreamConn);
+        errdefer gpa.destroy(sc);
+        sc.* = .{ .gpa = gpa, .server = server, .host = try gpa.dupe(u8, host), .use_tls = use_tls };
+        return sc;
+    }
+
+    pub fn destroy(sc: *StreamConn) void {
+        if (sc.fd >= 0) _ = c.close(sc.fd);
+        sc.pending.deinit(sc.gpa);
+        sc.gpa.free(sc.host);
+        sc.gpa.destroy(sc);
+    }
+
+    pub fn socket(sc: *StreamConn) net.Socket {
+        return .{ .ctx = sc, .sendFn = sendFn, .local = net.Address.ip4(.{ 0, 0, 0, 0 }, 0), .remote = sc.server };
+    }
+
+    /// Unblocks `run` (from another thread) so it returns.
+    pub fn close(sc: *StreamConn) void {
+        sc.state.store(.closed, .release);
+        if (sc.fd >= 0) _ = c.shutdown(sc.fd, 2);
+    }
+
+    fn sendFn(ctx: *anyopaque, _: net.Address, data: []const u8) void {
+        const sc: *StreamConn = @ptrCast(@alignCast(ctx));
+        sc.write_lock.lock();
+        defer sc.write_lock.unlock();
+        switch (sc.state.load(.acquire)) {
+            .open => sc.writeOut(data) catch sc.close(),
+            .connecting => if (sc.pending.items.len + data.len <= 64 * 1024) {
+                sc.pending.appendSlice(sc.gpa, data) catch {};
+            },
+            .failed, .closed => {},
+        }
+    }
+
+    fn writeOut(sc: *StreamConn, data: []const u8) !void {
+        if (sc.use_tls) {
+            try sc.client.writer.writeAll(data);
+            try sc.client.writer.flush();
+        } else {
+            try sc.raw_writer.writeAll(data);
+        }
+        try sc.raw_writer.flush();
+    }
+
+    fn fdStream(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+        const sc: *StreamConn = @alignCast(@fieldParentPtr("raw_reader", r));
+        const dest = limit.slice(try w.writableSliceGreedy(1));
+        const n = c.read(sc.fd, dest.ptr, dest.len);
+        if (n < 0) return error.ReadFailed;
+        if (n == 0) return error.EndOfStream;
+        w.advance(@intCast(n));
+        return @intCast(n);
+    }
+
+    fn fdWrite(fd: c.fd_t, data: []const u8) std.Io.Writer.Error!void {
+        var rest = data;
+        while (rest.len > 0) {
+            const n = c.write(fd, rest.ptr, rest.len);
+            if (n <= 0) return error.WriteFailed;
+            rest = rest[@intCast(n)..];
+        }
+    }
+
+    fn fdDrain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        const sc: *StreamConn = @alignCast(@fieldParentPtr("raw_writer", w));
+        try fdWrite(sc.fd, w.buffered());
+        w.end = 0;
+        var n: usize = 0;
+        for (data[0 .. data.len - 1]) |d| {
+            try fdWrite(sc.fd, d);
+            n += d.len;
+        }
+        const last = data[data.len - 1];
+        for (0..splat) |_| try fdWrite(sc.fd, last);
+        return n + last.len * splat;
+    }
+
+    fn connect(sc: *StreamConn) !void {
+        const fd = c.socket(c.AF.INET, c.SOCK.STREAM, 0);
+        if (fd < 0) return error.SocketFailed;
+        sc.fd = fd;
+        var sa = toSockaddr(sc.server);
+        if (c.connect(fd, @ptrCast(&sa), @sizeOf(c.sockaddr.in)) != 0) return error.ConnectFailed;
+        sc.raw_reader = .{ .vtable = &.{ .stream = fdStream }, .buffer = &sc.raw_read_buf, .seek = 0, .end = 0 };
+        sc.raw_writer = .{ .vtable = &.{ .drain = fdDrain }, .buffer = &sc.raw_write_buf };
+        if (!sc.use_tls) return;
+        var entropy: [tls.Client.Options.entropy_len]u8 = undefined;
+        arc4random_buf(&entropy, entropy.len);
+        sc.client = try tls.Client.init(&sc.raw_reader, &sc.raw_writer, .{
+            .host = if (sc.host.len > 0) .{ .explicit = sc.host } else .no_verification,
+            .ca = .no_verification,
+            .read_buffer = &sc.tls_read_buf,
+            .write_buffer = &sc.tls_write_buf,
+            .entropy = &entropy,
+            .realtime_now = now(null, .real),
+        });
+    }
+
+    /// Connects, then hands every received TURN message to `deliver` until closed. Runs on
+    /// the connection's own thread.
+    pub fn run(sc: *StreamConn, ctx: *anyopaque, deliver: *const fn (ctx: *anyopaque, msg: []const u8) void) void {
+        sc.connect() catch {
+            sc.state.store(.failed, .release);
+            return;
+        };
+        {
+            sc.write_lock.lock();
+            defer sc.write_lock.unlock();
+            if (sc.state.load(.acquire) == .closed) return;
+            sc.state.store(.open, .release);
+            if (sc.pending.items.len > 0) sc.writeOut(sc.pending.items) catch {};
+            sc.pending.clearRetainingCapacity();
+        }
+        const src: *std.Io.Reader = if (sc.use_tls) &sc.client.reader else &sc.raw_reader;
+        var msg: [4 + 65535 + 3]u8 = undefined;
+        while (sc.state.load(.acquire) == .open) {
+            src.readSliceAll(msg[0..4]) catch break;
+            const len = std.mem.readInt(u16, msg[2..4], .big);
+            const total: usize = switch (msg[0] >> 6) {
+                0 => 20 + @as(usize, len), // STUN: 20-byte header, length excludes it
+                1 => 4 + std.mem.alignForward(usize, len, 4), // ChannelData, padded over streams
+                else => break, // not TURN: the stream is out of step
+            };
+            src.readSliceAll(msg[4..total]) catch break;
+            deliver(ctx, msg[0..total]);
+        }
+        if (sc.state.load(.acquire) != .closed) sc.state.store(.failed, .release);
+    }
+};

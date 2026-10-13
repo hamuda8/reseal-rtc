@@ -60,6 +60,8 @@ pub const Config = struct {
     sockets: []const net.Socket,
     /// Resolved STUN/TURN servers (see `driver.resolveIceServers`).
     servers: []const IceAgent.Server = &.{},
+    /// iceTransportPolicy "relay": only TURN candidates.
+    ice_relay_only: bool = false,
     audio: bool = true,
     video: bool = true,
     /// Reuse a certificate across calls (its fingerprint is the identity); generated if null.
@@ -266,7 +268,7 @@ pub const PeerConnection = struct {
         }
         errdefer if (pc.owned_cert) |*c| c.deinit(gpa);
         try pc.transport.init(gpa, io, .{
-            .ice = .{ .role = .controlling, .servers = config.servers },
+            .ice = .{ .role = .controlling, .servers = config.servers, .relay_only = config.ice_relay_only },
             .certificate = pc.cert,
             .srtp_profiles = config.srtp_profiles,
         }, config.sockets, .{

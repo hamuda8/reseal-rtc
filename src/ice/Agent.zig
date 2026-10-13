@@ -31,10 +31,20 @@ pub const Server = struct {
     turn: bool = false,
     username: []const u8 = "",
     password: []const u8 = "",
+    /// How we reach a TURN server: UDP, or a stream (TCP, TLS) the owner opened as a socket
+    /// with `remote` set to `address` (for strict networks that only let TCP 443 out).
+    transport: Transport = .udp,
+    /// The server's host name, for TLS (SNI).
+    host: []const u8 = "",
+
+    pub const Transport = enum { udp, tcp, tls };
 };
 
 pub const Config = struct {
     role: Role,
+    /// RTCPeerConnection's iceTransportPolicy "relay": only TURN candidates (no host or
+    /// server-reflexive ones are signalled or paired), e.g. to hide the device's addresses.
+    relay_only: bool = false,
     servers: []const Server = &.{},
     /// Pacing between new checks (Ta).
     check_interval_ms: u64 = 50,
@@ -240,20 +250,27 @@ pub fn gather(a: *Agent, now: u64) !void {
     a.now = now;
     if (a.gathering_started) return;
     a.gathering_started = true;
-    for (a.sockets, 0..) |s, i| {
-        if (s.local.isUnspecified()) continue;
+    if (!a.config.relay_only) for (a.sockets, 0..) |s, i| {
+        if (s.local.isUnspecified() or s.remote != null) continue;
         try a.addLocal(.host, s.local, null, .{ .socket = @intCast(i) }, true, @intCast(1000 + i));
-    }
+    };
     for (a.config.servers) |srv| {
         for (a.sockets, 0..) |s, i| {
-            if (s.local.family != srv.address.family) continue;
+            // UDP servers over the UDP sockets; a stream server over its own connection.
+            if (srv.turn and srv.transport != .udp) {
+                if (s.remote == null or !s.remote.?.eql(srv.address)) continue;
+            } else if (s.remote != null) continue;
+            if (s.local.family != srv.address.family and s.remote == null) continue;
             if (srv.turn) {
                 const out: TurnClient.Output = .{ .ctx = a, .send = turnSend };
                 var t = try TurnClient.init(a.gpa, a.io, out, @intCast(i), srv.address, srv.username, srv.password);
                 errdefer t.deinit();
+                if (srv.transport != .udp) t.setStream();
                 try a.turns.append(a.gpa, t);
                 try a.turn_settled.append(a.gpa, false);
                 a.turns.items[a.turns.items.len - 1].start(now);
+            } else if (a.config.relay_only) {
+                continue;
             } else {
                 var g: Gather = .{ .txid = undefined, .socket = @intCast(i), .server = srv.address, .next_at = now + 300, .attempts = 1 };
                 a.io.random(&g.txid);
@@ -287,7 +304,9 @@ fn checkGatheringDone(a: *Agent) void {
 
 fn addLocal(a: *Agent, t: cand.Type, addr: Address, related: ?Address, base: Base, pairable: bool, foundation: u32) !void {
     for (a.locals.items) |l| if (l.c.type == t and l.c.address.eql(addr)) return;
-    const local_pref: u16 = 65535 - @as(u16, base.socket) * 64 - (if (base.turn) |x| @as(u16, x) else 0);
+    // Relays reached over a stream rank below UDP relays (RFC 8445 5.1.2.1: prefer UDP).
+    const stream_relay = if (base.turn) |x| a.turns.items[x].stream else false;
+    const local_pref: u16 = 65535 - @as(u16, base.socket) * 64 - (if (base.turn) |x| @as(u16, x) else 0) - @as(u16, if (stream_relay) 8192 else 0);
     var c: Candidate = .{ .priority = cand.priority(t, local_pref, 1), .address = addr, .type = t, .related = related };
     var fbuf: [16]u8 = undefined;
     c.setFoundation(std.fmt.bufPrint(&fbuf, "{d}", .{foundation}) catch unreachable);
@@ -453,7 +472,7 @@ fn receiveOnBase(a: *Agent, base: Base, from: Address, data: []const u8) ?[]cons
 fn turnAllocated(a: *Agent, ti: u8) void {
     const t = &a.turns.items[ti];
     a.turn_settled.items[ti] = true;
-    if (!t.mapped.isUnspecified()) {
+    if (!t.mapped.isUnspecified() and !a.config.relay_only and !t.stream) {
         const host = a.sockets[t.socket].local;
         if (!t.mapped.eql(host)) a.addLocal(.srflx, t.mapped, host, .{ .socket = t.socket }, false, 2000 + @as(u32, t.socket)) catch {};
     }

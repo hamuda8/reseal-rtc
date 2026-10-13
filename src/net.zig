@@ -107,6 +107,10 @@ pub const Socket = struct {
     /// The address this socket is bound to; used as the host candidate. Must be a concrete
     /// interface address (not 0.0.0.0) for it to be useful to the remote peer.
     local: Address,
+    /// Set for a stream connection (TCP or TLS) to one TURN server: it carries only that
+    /// server's traffic (TURN messages framed on the stream, RFC 8656 §12.5), never makes a
+    /// host candidate, and `send` ignores its `to`.
+    remote: ?Address = null,
 
     pub fn send(s: Socket, to: Address, data: []const u8) void {
         s.sendFn(s.ctx, to, data);

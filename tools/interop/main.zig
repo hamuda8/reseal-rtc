@@ -28,6 +28,7 @@ const State = struct {
     first_video_nal_count: usize = 0,
     keyframe_requests: u64 = 0,
     remote_bitrate: u64 = 0,
+    send_bitrate: u32 = 0,
     want_keyframe: bool = true,
     log: std.ArrayList(u8) = .empty,
     gpa: std.mem.Allocator,
@@ -77,6 +78,7 @@ const State = struct {
                 s.want_keyframe = true;
             },
             .remote_bitrate => |b| s.remote_bitrate = b,
+            .send_bitrate => |b| s.send_bitrate = b.bps,
         }
     }
 };
@@ -234,7 +236,7 @@ fn handle(app: *App, stream: Io.net.Stream) !void {
         });
         try ow.print("\"audio_sent\":{d},\"video_sent\":{d},\"audio_received_packets\":{d},\"video_received_packets\":{d},", .{ st.audio_sent, st.video_sent, st.audio_received, st.video_received });
         try ow.print("\"audio_frames\":{d},\"video_frames\":{d},\"video_keyframes\":{d},\"video_corrupt\":{d},\"srtp_errors\":{d},", .{ s.audio_frames, s.video_frames, s.video_keyframes, s.video_corrupt, st.srtp_errors });
-        try ow.print("\"keyframe_requests\":{d},\"remote_bitrate\":{d},\"first_video_nal_types\":[", .{ s.keyframe_requests, s.remote_bitrate });
+        try ow.print("\"keyframe_requests\":{d},\"remote_bitrate\":{d},\"send_bitrate\":{d},\"first_video_nal_types\":[", .{ s.keyframe_requests, s.remote_bitrate, s.send_bitrate });
         for (s.first_video_nals[0..s.first_video_nal_count], 0..) |t, i| try ow.print("{s}{d}", .{ if (i == 0) "" else ",", t });
         try ow.writeAll("],\"selected\":\"");
         if (st.local_candidate) |c| try ow.print("{f} -> {f}", .{ c.address, st.remote_candidate.?.address });

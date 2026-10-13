@@ -50,8 +50,9 @@ pub const Sink = struct {
     /// The other side wants a keyframe from our encoder.
     keyframe: *const fn (ctx: *anyopaque) void,
     /// The bitrate our video encoder should use now (bits per second), from the other side's
-    /// reports: loss, round-trip time and its bandwidth estimate. Optional.
-    bitrate: ?*const fn (ctx: *anyopaque, bps: u32) void = null,
+    /// reports: loss, round-trip time and its bandwidth estimate, with the loss (0..1) behind it
+    /// (media steps the resolution down on loss, not on a low but clean estimate). Optional.
+    bitrate: ?*const fn (ctx: *anyopaque, bps: u32, loss: f32) void = null,
 };
 
 /// Tests only: drop this percentage of outgoing video packets, to watch adaptation work.
@@ -322,7 +323,7 @@ fn onEvent(ctx: *anyopaque, e: peer_mod.Event) void {
         .audio_frame => |f| p.sink.audio(p.sink.ctx, f.data),
         .video_frame => |f| p.sink.video(p.sink.ctx, f.data, f.keyframe, f.rotation),
         .keyframe_requested => p.sink.keyframe(p.sink.ctx),
-        .send_bitrate => |b| if (p.sink.bitrate) |f| f(p.sink.ctx, b.bps),
+        .send_bitrate => |b| if (p.sink.bitrate) |f| f(p.sink.ctx, b.bps, b.loss),
         .gathering_done, .remote_bitrate => {},
     }
 }

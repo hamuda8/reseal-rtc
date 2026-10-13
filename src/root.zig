@@ -21,6 +21,9 @@ pub const Socket = net.Socket;
 /// std.Io glue: UDP sockets, clock, ICE server URL resolution, run loop.
 pub const driver = @import("driver.zig");
 
+/// Engine for zig-core's zui calls API on the phones: `pub const rtc = @import("reseal_rtc").zui_engine;`.
+pub const zui_engine = @import("zui_engine.zig");
+
 // ---- layers, for apps that compose their own pipeline or want the codecs' helpers ----------
 
 pub const stun = @import("ice/stun.zig");
@@ -48,6 +51,7 @@ test {
     _ = peer;
     _ = net;
     _ = driver;
+    _ = zui_engine;
     _ = stun;
     _ = candidate;
     _ = TurnClient;

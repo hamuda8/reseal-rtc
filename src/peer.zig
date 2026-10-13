@@ -37,7 +37,9 @@ pub const Event = union(enum) {
     /// One received Opus packet.
     audio_frame: struct { ssrc: u32, timestamp: u32, data: []const u8 },
     /// One received H.264 access unit in Annex-B form.
-    video_frame: struct { ssrc: u32, timestamp: u32, data: []const u8, keyframe: bool, corrupt: bool },
+    /// `rotation`: degrees clockwise the picture must be turned to stand upright (0, 90, 180
+    /// or 270), from the sender's video-orientation extension.
+    video_frame: struct { ssrc: u32, timestamp: u32, data: []const u8, keyframe: bool, corrupt: bool, rotation: u16 = 0 },
     /// The peer asked for a keyframe (PLI/FIR): the app should make its encoder emit an IDR.
     keyframe_requested,
     /// The peer's receive-side bandwidth estimate for our video (REMB), bits per second.
@@ -70,6 +72,9 @@ pub const SdpType = enum { offer, answer };
 
 const opus_pt_default = 111;
 const h264_pt_default = 102;
+/// RTP header extension for the picture's rotation (3GPP TS 26.114, "CVO").
+const cvo_uri = "urn:3gpp:video-orientation";
+const cvo_default_id = 13;
 const h264_fmtp = "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f";
 const video_feedback = [_][]const u8{ "goog-remb", "ccm fir", "nack", "nack pli" };
 const max_rtp_payload = 1200 - 12 - 16; // datagram budget minus RTP header and SRTP tag
@@ -92,6 +97,8 @@ const Track = struct {
     last_send_ms: u64 = 0,
     sent_any: bool = false,
     remote_nack: bool = false,
+    /// Negotiated id of the video-orientation extension (0: not negotiated).
+    cvo_id: u8 = 0,
 
     fn midText(t: *const Track) []const u8 {
         return t.mid[0..t.mid_len];
@@ -105,6 +112,7 @@ const Track = struct {
 };
 
 const RemoteStream = struct {
+    rotation: u16 = 0,
     ssrc: u32,
     kind: Kind,
     clock: u32,
@@ -201,6 +209,10 @@ pub const PeerConnection = struct {
     next_rtcp_at: u64 = 0,
     remote_bitrate: u64 = 0,
     now: u64 = 0,
+    /// Rotation sent with our video (video-orientation extension), degrees clockwise.
+    video_rotation: u16 = 0,
+    /// `restartIce` was called: the next offer carries new ICE credentials.
+    restart_pending: bool = false,
 
     pub fn create(gpa: std.mem.Allocator, io: std.Io, config: Config) !*PeerConnection {
         const pc = try gpa.create(PeerConnection);
@@ -338,6 +350,7 @@ pub const PeerConnection = struct {
                 pc.mlines[pc.mline_count] = .{ .track = @intCast(i) };
                 pc.mline_count += 1;
             }
+            pc.tracks[1].cvo_id = cvo_default_id;
         } else {
             // Re-offer: same m-lines and mids; ICE and DTLS roles stay as negotiated.
             pc.session_version += 1;
@@ -345,6 +358,10 @@ pub const PeerConnection = struct {
                 t.send = true;
                 t.recv = true;
             };
+        }
+        if (pc.restart_pending) {
+            pc.restart_pending = false;
+            pc.restartIceNow();
         }
         pc.signaling = .have_local_offer;
         try pc.transport.ice.gather(now);
@@ -369,6 +386,7 @@ pub const PeerConnection = struct {
         var n: usize = 0;
         var fp_buf: [95]u8 = undefined;
         const audio_codec = [_]sdp.LocalCodec{.{ .pt = pc.tracks[0].pt, .name = "opus", .clock = opus.clock_rate, .channels = 2, .fmtp = opus.default_fmtp }};
+        const cvo_ext = [_]sdp.Extmap{.{ .id = pc.tracks[1].cvo_id, .uri = cvo_uri }};
         const video_codec = [_]sdp.LocalCodec{.{ .pt = pc.tracks[1].pt, .name = "H264", .clock = 90000, .fmtp = h264_fmtp, .feedback = &video_feedback }};
         // m-lines in negotiated order (an answer mirrors the offer, rejected lines included).
         for (pc.mlines[0..pc.mline_count]) |*ml| {
@@ -396,6 +414,7 @@ pub const PeerConnection = struct {
                 .stream_id = "reseal",
                 .track_id = if (t.kind == .audio) "audio0" else "video0",
                 .rtcp_rsize = t.kind == .video,
+                .extmaps = if (t.kind == .video and t.cvo_id != 0) &cvo_ext else &.{},
                 .rejected = !t.accepted,
             };
             n += 1;
@@ -454,6 +473,8 @@ pub const PeerConnection = struct {
         const fp = sdp.splitFingerprint(fp_attr) orelse return error.MissingFingerprint;
         if (!std.ascii.eqlIgnoreCase(fp.algorithm, "sha-256")) return error.UnsupportedFingerprint;
         pc.transport.setRemoteFingerprint(try certs.parseFingerprint(fp.value));
+        // New credentials in an offer: the peer restarted ICE, and our answer restarts too.
+        if (kind == .offer and pc.transport.ice.remoteCredentialsChanged(ufrag, pwd)) pc.restartIceNow();
         try pc.transport.ice.setRemoteCredentials(ufrag, pwd);
         for (s.media) |*m| {
             var it = m.attrs("candidate");
@@ -505,6 +526,7 @@ pub const PeerConnection = struct {
             t.send = dir == .sendrecv or dir == .recvonly;
             t.recv = dir == .sendrecv or dir == .sendonly;
             t.remote_nack = m.hasFeedback(t.pt, "nack");
+            if (k == .video) t.cvo_id = m.extmapId(cvo_uri) orelse 0;
             try pc.noteRemoteSsrcs(k, m);
         }
     }
@@ -531,6 +553,7 @@ pub const PeerConnection = struct {
             t.send = dir == .sendrecv or dir == .recvonly;
             t.recv = dir == .sendrecv or dir == .sendonly;
             t.remote_nack = m.hasFeedback(t.pt, "nack");
+            if (t.kind == .video) t.cvo_id = m.extmapId(cvo_uri) orelse 0;
             try pc.noteRemoteSsrcs(t.kind, m);
         }
     }
@@ -568,6 +591,62 @@ pub const PeerConnection = struct {
             }
         }
         return best;
+    }
+
+    /// Undoes our pending offer (perfect negotiation: the polite side gives way when both
+    /// offered at once). A first offer is forgotten entirely; a re-offer leaves the session as
+    /// negotiated before it.
+    pub fn rollback(pc: *PeerConnection) void {
+        if (pc.signaling != .have_local_offer) return;
+        pc.signaling = .stable;
+        if (pc.transport.dtls == null and !pc.answered_once) {
+            pc.offerer = false;
+            pc.mline_count = 0;
+            for (&pc.tracks) |*t| {
+                t.accepted = false;
+                t.mid_len = 0;
+                t.cvo_id = 0;
+            }
+        }
+    }
+
+    /// Asks for an ICE restart: the next `createOffer` carries new ICE credentials and the
+    /// candidates are signalled again. DTLS and SRTP continue over the new path.
+    pub fn restartIce(pc: *PeerConnection) void {
+        pc.restart_pending = true;
+    }
+
+    fn restartIceNow(pc: *PeerConnection) void {
+        for (pc.local_candidates.items) |c| pc.gpa.free(c);
+        pc.local_candidates.clearRetainingCapacity();
+        pc.transport.ice.restart();
+    }
+
+    pub fn isStable(pc: *const PeerConnection) bool {
+        return pc.signaling == .stable;
+    }
+
+    /// The mid of the first m-line, for RTCIceCandidateInit.sdpMid (BUNDLE: all share it).
+    pub fn firstMid(pc: *const PeerConnection) []const u8 {
+        if (pc.mline_count == 0) return "0";
+        const ml = &pc.mlines[0];
+        return if (ml.track) |i| pc.tracks[i].midText() else ml.mid.text();
+    }
+
+    pub fn iceUfrag(pc: *const PeerConnection) []const u8 {
+        return pc.transport.ice.localUfrag();
+    }
+
+    /// Which media the peer sends us, per the negotiated session.
+    pub fn remoteSends(pc: *const PeerConnection, kind: Kind) bool {
+        const t = &pc.tracks[@backingInt(kind)];
+        return t.accepted and t.recv;
+    }
+
+    /// Rotation to send with our video (degrees clockwise the receiver turns it: 0, 90, 180,
+    /// 270), e.g. the camera sensor's orientation relative to the screen.
+    pub fn setVideoRotation(pc: *PeerConnection, degrees: u16) void {
+        pc.video_rotation = degrees % 360;
     }
 
     /// A trickled remote candidate ("candidate:..." with or without "a="). Empty strings
@@ -654,7 +733,10 @@ pub const PeerConnection = struct {
     fn sendRtp(pc: *PeerConnection, t: *Track, payload: []const u8, ts: u32, marker: bool) !void {
         const ctx = &(pc.srtp_send orelse return error.NotConnected);
         var buf: [1500]u8 = undefined;
-        const n = try rtp.write(&buf, marker, @intCast(t.pt), t.seq, ts, t.local_ssrc, payload);
+        const n = if (t.kind == .video and t.cvo_id != 0 and marker)
+            try rtp.writeWithElement(&buf, marker, @intCast(t.pt), t.seq, ts, t.local_ssrc, @intCast(t.cvo_id), @intCast(pc.video_rotation / 90 % 4), payload)
+        else
+            try rtp.write(&buf, marker, @intCast(t.pt), t.seq, ts, t.local_ssrc, payload);
         const len = try ctx.protectRtp(&buf, n);
         if (t.kind == .video) {
             const h = &pc.history[pc.history_next];
@@ -812,6 +894,9 @@ pub const PeerConnection = struct {
     fn handleRtp(pc: *PeerConnection, p: rtp.Packet) void {
         const s = pc.streamFor(p) orelse return;
         if (p.payload_type != pc.tracks[@backingInt(s.kind)].pt) return;
+        if (s.kind == .video and pc.tracks[1].cvo_id != 0) {
+            if (p.extensionElement(@intCast(pc.tracks[1].cvo_id))) |v| s.rotation = @as(u16, v[0] & 3) * 90;
+        }
         // Statistics (RFC 3550 A.3, A.8).
         const ext = if (s.base_seq == null) @as(u64, p.seq) + 0x10000 else rtp.extendSeq(s.max_seq, p.seq);
         if (s.base_seq == null) {
@@ -845,7 +930,7 @@ pub const PeerConnection = struct {
                         const corrupt = pc.depacketizer.corrupt or f.discontinuity;
                         const key = data.len > 0 and h264.isKeyframe(data);
                         if (corrupt and !key) pc.sendPli(s, false);
-                        if (data.len > 0) pc.emit(.{ .video_frame = .{ .ssrc = s.ssrc, .timestamp = f.timestamp, .data = data, .keyframe = key, .corrupt = corrupt } });
+                        if (data.len > 0) pc.emit(.{ .video_frame = .{ .ssrc = s.ssrc, .timestamp = f.timestamp, .data = data, .keyframe = key, .corrupt = corrupt, .rotation = s.rotation } });
                     },
                 }
             }

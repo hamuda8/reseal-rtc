@@ -80,8 +80,13 @@ fn onIceState(ctx: *anyopaque, s: IceAgent.State) void {
     const t: *PeerTransport = @ptrCast(@alignCast(ctx));
     t.events.ice_state(t.events.ctx, s);
     switch (s) {
-        .checking => t.setState(.connecting),
-        .connected => t.maybeStartDtls(),
+        // An ICE restart while connected keeps media on the old path: stay connected.
+        .checking => if (t.state != .connected) t.setState(.connecting),
+        .connected => {
+            t.maybeStartDtls();
+            // Back from a failure through an ICE restart: DTLS survived it.
+            if (t.dtls) |*d| if (d.state == .connected) t.setState(.connected);
+        },
         .failed => t.setState(.failed),
         else => {},
     }

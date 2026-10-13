@@ -95,6 +95,22 @@ pub fn freeServers(gpa: std.mem.Allocator, servers: []const IceAgent.Server) voi
 }
 
 /// An IP literal or a host name (first IPv4 answer preferred).
+/// The address this machine would use to reach the Internet (the default route's interface),
+/// found by "connecting" a UDP socket, which sends nothing. Null without a route. (Zig 0.17's
+/// Windows backend rejects connected UDP sockets; phones and Linux are fine.)
+pub fn defaultLocalAddress(io: Io, family: net.Address.Family) ?net.Address {
+    const probe: Io.net.IpAddress = switch (family) {
+        .ip4 => .{ .ip4 = .{ .bytes = .{ 8, 8, 8, 8 }, .port = 53 } },
+        .ip6 => .{ .ip6 = .{ .bytes = .{ 0x20, 0x01, 0x48, 0x60, 0x48, 0x60, 0, 0, 0, 0, 0, 0, 0, 0, 0x88, 0x88 }, .port = 53 } },
+    };
+    const s = probe.connect(io, .{ .mode = .dgram, .protocol = .udp }) catch return null;
+    defer s.close(io);
+    var a = net.Address.fromStd(s.socket.address);
+    if (a.isUnspecified()) return null;
+    a.port = 0;
+    return a;
+}
+
 pub fn resolve(io: Io, host: []const u8, port: u16) !net.Address {
     if (net.Address.parseIp(host, port)) |a| return a else |_| {}
     const name = try Io.net.HostName.init(host);
@@ -122,6 +138,9 @@ pub const Driver = struct {
     sockets: []UdpSocket,
     mutex: Io.Mutex = .init,
     group: Io.Group = .init,
+    /// Called with the lock held after every receive and poll: a place to act on what the
+    /// handler saw (renegotiate, restart ICE) without re-entering the PeerConnection.
+    on_tick: ?struct { ctx: *anyopaque, f: *const fn (ctx: *anyopaque) void } = null,
 
     pub fn init(io: Io, pc: *PeerConnection, sockets: []UdpSocket) Driver {
         return .{ .io = io, .pc = pc, .sockets = sockets };
@@ -155,6 +174,7 @@ pub const Driver = struct {
             try d.mutex.lock(d.io);
             defer d.mutex.unlock(d.io);
             d.pc.receive(index, net.Address.fromStd(msg.from), msg.data, nowMs(d.io));
+            if (d.on_tick) |h| h.f(h.ctx);
         }
     }
 
@@ -166,6 +186,7 @@ pub const Driver = struct {
                 defer d.mutex.unlock(d.io);
                 const now = nowMs(d.io);
                 d.pc.poll(now);
+                if (d.on_tick) |h| h.f(h.ctx);
                 if (d.pc.nextTimeout()) |t| wait_ms = std.math.clamp(t -| now, 1, 20);
             }
             try d.io.sleep(.fromMilliseconds(@intCast(wait_ms)), .awake);

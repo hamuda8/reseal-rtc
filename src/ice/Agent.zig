@@ -134,6 +134,8 @@ first_valid_at: ?u64 = null,
 checking_since: u64 = 0,
 next_check_at: u64 = 0,
 now: u64 = 0,
+/// The previous path during an ICE restart: media keeps flowing on it until a new pair is selected.
+fallback: ?struct { base: Base, to: Address } = null,
 
 pub fn init(gpa: std.mem.Allocator, io: std.Io, config: Config, sockets: []const Socket, cb: Callbacks) !Agent {
     var a: Agent = .{
@@ -191,6 +193,37 @@ pub fn setRemoteCredentials(a: *Agent, ufrag: []const u8, pwd: []const u8) !void
     a.remote_pwd.clearRetainingCapacity();
     try a.remote_pwd.appendSlice(a.gpa, pwd);
     a.startChecking();
+}
+
+/// True when the remote description carries credentials other than the ones in use: the peer
+/// restarted ICE.
+pub fn remoteCredentialsChanged(a: *const Agent, ufrag: []const u8, pwd: []const u8) bool {
+    if (!a.hasRemoteCredentials()) return false;
+    return !std.mem.eql(u8, a.remote_ufrag.items, ufrag) or !std.mem.eql(u8, a.remote_pwd.items, pwd);
+}
+
+/// ICE restart (RFC 8445 9): new local credentials, the remote side's candidates and every pair
+/// forgotten, and our candidates signalled again for the new generation. Gathered candidates and
+/// TURN allocations are kept. Until a new pair is selected, sending uses the old path.
+pub fn restart(a: *Agent) void {
+    if (a.selected) |s| {
+        const p = a.pairs.items[s];
+        a.fallback = .{ .base = a.locals.items[p.local].base, .to = a.remotes.items[p.remote].address };
+    }
+    randomIceChars(a.io, &a.local_ufrag);
+    randomIceChars(a.io, &a.local_pwd);
+    a.remote_ufrag.clearRetainingCapacity();
+    a.remote_pwd.clearRetainingCapacity();
+    a.remotes.clearRetainingCapacity();
+    a.pairs.clearRetainingCapacity();
+    a.checks.clearRetainingCapacity();
+    a.triggered.clearRetainingCapacity();
+    a.selected = null;
+    a.nominating = false;
+    a.first_valid_at = null;
+    // Quietly back to new: the owner sees "checking" once the new credentials arrive.
+    if (a.state != .closed) a.state = .new;
+    for (a.locals.items) |*l| a.cb.candidate(a.cb.ctx, &l.c);
 }
 
 fn startChecking(a: *Agent) void {
@@ -332,7 +365,10 @@ fn sendFrom(a: *Agent, base: Base, to: Address, data: []const u8) void {
 
 /// Sends application data (DTLS, SRTP) on the selected pair.
 pub fn send(a: *Agent, data: []const u8) !void {
-    const pi = a.selected orelse return error.NotConnected;
+    const pi = a.selected orelse {
+        const f = a.fallback orelse return error.NotConnected;
+        return a.sendFrom(f.base, f.to, data);
+    };
     const p = a.pairs.items[pi];
     a.sendFrom(a.locals.items[p.local].base, a.remotes.items[p.remote].address, data);
 }
@@ -533,6 +569,7 @@ fn updateProvisional(a: *Agent) void {
 
 fn select(a: *Agent, pi: u16) void {
     a.selected = pi;
+    a.fallback = null;
     const p = &a.pairs.items[pi];
     if (p.next_consent == 0) p.next_consent = a.now + a.consentInterval();
     a.setState(.connected);

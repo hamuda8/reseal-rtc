@@ -81,6 +81,17 @@ pub fn write(buf: []u8, marker: bool, pt: u7, seq: u16, timestamp: u32, ssrc: u3
     return 12 + payload.len;
 }
 
+/// Like `write`, plus a one-byte header extension (RFC 8285) carrying a single 1-byte element
+/// (used for the video orientation, urn:3gpp:video-orientation).
+pub fn writeWithElement(buf: []u8, marker: bool, pt: u7, seq: u16, timestamp: u32, ssrc: u32, id: u4, value: u8, payload: []const u8) !usize {
+    if (buf.len < 20 + payload.len) return error.NoSpaceLeft;
+    _ = try write(buf, marker, pt, seq, timestamp, ssrc, &.{});
+    buf[0] |= 0x10;
+    buf[12..20].* = .{ 0xBE, 0xDE, 0, 1, @as(u8, id) << 4, value, 0, 0 };
+    @memcpy(buf[20..][0..payload.len], payload);
+    return 20 + payload.len;
+}
+
 /// RFC 5761 4: RTCP packet types 192..223 share the first byte range with RTP; tell them apart
 /// by the second byte when rtcp-mux is in use.
 pub fn isRtcp(data: []const u8) bool {
@@ -113,6 +124,14 @@ test "extension and padding" {
     const p = try Packet.parse(&pkt);
     try std.testing.expectEqualStrings("0", p.extensionElement(4).?);
     try std.testing.expectEqualStrings("hi", p.payload);
+}
+
+test "one-byte extension element round trip" {
+    var buf: [64]u8 = undefined;
+    const n = try writeWithElement(&buf, true, 102, 9, 90000, 7, 13, 1, "frame");
+    const p = try Packet.parse(buf[0..n]);
+    try std.testing.expectEqual(@as(u8, 1), p.extensionElement(13).?[0]);
+    try std.testing.expectEqualStrings("frame", p.payload);
 }
 
 test "extend sequence across wrap" {

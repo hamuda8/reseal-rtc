@@ -45,7 +45,7 @@ pub const FragmentHeader = struct {
     pub fn parse(data: []const u8) !struct { FragmentHeader, []const u8 } {
         if (data.len < header_len) return error.Truncated;
         const h: FragmentHeader = .{
-            .type = @enumFromInt(data[0]),
+            .type = @fromBackingInt(@intCast(data[0])),
             .length = std.mem.readInt(u24, data[1..4], .big),
             .seq = std.mem.readInt(u16, data[4..6], .big),
             .offset = std.mem.readInt(u24, data[6..9], .big),
@@ -56,7 +56,7 @@ pub const FragmentHeader = struct {
     }
 
     pub fn write(h: FragmentHeader, out: *[header_len]u8) void {
-        out[0] = @intFromEnum(h.type);
+        out[0] = @backingInt(h.type);
         std.mem.writeInt(u24, out[1..4], @intCast(h.length), .big);
         std.mem.writeInt(u16, out[4..6], h.seq, .big);
         std.mem.writeInt(u24, out[6..9], @intCast(h.offset), .big);

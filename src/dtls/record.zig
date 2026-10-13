@@ -40,7 +40,7 @@ pub const Iterator = struct {
         if (header_len + len > h.len) return null;
         it.pos += header_len + len;
         return .{
-            .content_type = @enumFromInt(h[0]),
+            .content_type = @fromBackingInt(@intCast(h[0])),
             .version = std.mem.readInt(u16, h[1..3], .big),
             .epoch = std.mem.readInt(u16, h[3..5], .big),
             .seq = std.mem.readInt(u48, h[5..11], .big),
@@ -50,7 +50,7 @@ pub const Iterator = struct {
 };
 
 pub fn writeHeader(out: *[header_len]u8, ct: ContentType, epoch: u16, seq: u64, len: usize) void {
-    out[0] = @intFromEnum(ct);
+    out[0] = @backingInt(ct);
     std.mem.writeInt(u16, out[1..3], version_dtls12, .big);
     std.mem.writeInt(u16, out[3..5], epoch, .big);
     std.mem.writeInt(u48, out[5..11], @intCast(seq), .big);
@@ -66,7 +66,7 @@ pub const Cipher = struct {
         var a: [13]u8 = undefined;
         std.mem.writeInt(u16, a[0..2], epoch, .big);
         std.mem.writeInt(u48, a[2..8], @intCast(seq), .big);
-        a[8] = @intFromEnum(ct);
+        a[8] = @backingInt(ct);
         std.mem.writeInt(u16, a[9..11], version_dtls12, .big);
         std.mem.writeInt(u16, a[11..13], @intCast(len), .big);
         return a;

@@ -51,15 +51,15 @@ pub const attr = struct {
 };
 
 pub fn messageType(method: Method, class: Class) u16 {
-    const m: u16 = @intFromEnum(method);
-    const c: u16 = @intFromEnum(class);
+    const m: u16 = @backingInt(method);
+    const c: u16 = @backingInt(class);
     return (m & 0x000F) | ((m & 0x0070) << 1) | ((m & 0x0F80) << 2) | ((c & 1) << 4) | ((c & 2) << 7);
 }
 
 fn splitType(t: u16) struct { Method, Class } {
     const m = (t & 0x000F) | ((t >> 1) & 0x0070) | ((t >> 2) & 0x0F80);
     const c = ((t >> 4) & 1) | ((t >> 7) & 2);
-    return .{ @enumFromInt(m), @enumFromInt(c) };
+    return .{ @fromBackingInt(@intCast(m)), @fromBackingInt(@intCast(c)) };
 }
 
 /// Cheap check used by the demultiplexer (RFC 7983: first byte 0..3) plus the magic cookie.

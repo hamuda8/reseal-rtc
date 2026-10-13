@@ -229,7 +229,7 @@ fn handle(app: *App, stream: Io.net.Stream) !void {
         defer out.deinit();
         const ow = &out.writer;
         try ow.print("{{\"mode\":\"{t}\",\"ice\":\"{t}\",\"connection\":\"{t}\",\"dtls_role\":\"{s}\",\"srtp_profile\":\"{s}\",", .{
-            app.mode,                                                                st.ice, st.connection,
+            app.mode,                                                    st.ice,                                           st.connection,
             if (app.pc.transport.isDtlsClient()) "client" else "server", if (st.srtp_profile) |p| @tagName(p) else "none",
         });
         try ow.print("\"audio_sent\":{d},\"video_sent\":{d},\"audio_received_packets\":{d},\"video_received_packets\":{d},", .{ st.audio_sent, st.video_sent, st.audio_received, st.video_received });

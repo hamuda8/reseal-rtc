@@ -139,6 +139,14 @@ sockets per PeerConnection (a 10-person mesh is 9 PeerConnections, 9 sockets).
   `keyframe_requested`, request a sync frame from the encoder. `corrupt` frames are delivered
   but the engine already asked the sender for a keyframe (PLI).
 
+### Platforms
+
+Compiles for aarch64-linux-android, aarch64-macos, x86_64-linux and Windows as is. For
+aarch64-ios, Zig 0.17's default panic handler pulls in `std.Io.Threaded` process-spawning code
+that does not compile for iOS (a std issue, independent of this library); an iOS app must
+declare its own `pub const panic` in its root file, which iOS apps do anyway. With that, the
+whole module, `driver` included, compiles for iOS in Debug and ReleaseFast.
+
 ### Signalling with Reseal
 
 Reseal's `call.signal` messages carry `{ description: { type, sdp }, sig }` and

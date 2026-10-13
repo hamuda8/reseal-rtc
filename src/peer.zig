@@ -481,7 +481,7 @@ pub const PeerConnection = struct {
             const kind: ?Kind = if (std.mem.eql(u8, m.kind, "audio")) .audio else if (std.mem.eql(u8, m.kind, "video")) .video else null;
             // One track per kind; anything else (data channels, extra tracks) is rejected
             // with a port-0 m-line so the answer still mirrors the offer.
-            if (kind == null or pc.tracks[@intFromEnum(kind.?)].mid_len != 0) {
+            if (kind == null or pc.tracks[@backingInt(kind.?)].mid_len != 0) {
                 var ml: MLine = .{ .track = null };
                 ml.kind.set(m.kind);
                 ml.mid.set(mid);
@@ -491,8 +491,8 @@ pub const PeerConnection = struct {
                 pc.mline_count += 1;
                 continue;
             }
-            const t = &pc.tracks[@intFromEnum(kind.?)];
-            pc.mlines[pc.mline_count] = .{ .track = @intFromEnum(kind.?) };
+            const t = &pc.tracks[@backingInt(kind.?)];
+            pc.mlines[pc.mline_count] = .{ .track = @backingInt(kind.?) };
             pc.mline_count += 1;
             t.setMid(mid);
             const k = kind.?;
@@ -537,7 +537,7 @@ pub const PeerConnection = struct {
 
     fn noteRemoteSsrcs(pc: *PeerConnection, kind: Kind, m: *const sdp.Media) !void {
         var buf: [8]u32 = undefined;
-        for (m.ssrcs(&buf)) |ssrc| try pc.remote_ssrcs[@intFromEnum(kind)].append(pc.gpa, ssrc);
+        for (m.ssrcs(&buf)) |ssrc| try pc.remote_ssrcs[@backingInt(kind)].append(pc.gpa, ssrc);
     }
 
     fn findOpus(m: *const sdp.Media) ?u8 {
@@ -793,12 +793,12 @@ pub const PeerConnection = struct {
         for (pc.streams.items) |*s| if (s.ssrc == p.ssrc) return s;
         // New SSRC: classify by announced SSRC, else by payload type.
         const kind: Kind = blk: {
-            for (pc.remote_ssrcs, 0..) |list, k| if (std.mem.indexOfScalar(u32, list.items, p.ssrc) != null) break :blk @enumFromInt(k);
+            for (pc.remote_ssrcs, 0..) |list, k| if (std.mem.indexOfScalar(u32, list.items, p.ssrc) != null) break :blk @fromBackingInt(@intCast(k));
             if (pc.tracks[0].accepted and p.payload_type == pc.tracks[0].pt) break :blk .audio;
             if (pc.tracks[1].accepted and p.payload_type == pc.tracks[1].pt) break :blk .video;
             return null;
         };
-        const t = &pc.tracks[@intFromEnum(kind)];
+        const t = &pc.tracks[@backingInt(kind)];
         if (!t.accepted or p.payload_type != t.pt) return null;
         pc.streams.append(pc.gpa, .{
             .ssrc = p.ssrc,
@@ -811,7 +811,7 @@ pub const PeerConnection = struct {
 
     fn handleRtp(pc: *PeerConnection, p: rtp.Packet) void {
         const s = pc.streamFor(p) orelse return;
-        if (p.payload_type != pc.tracks[@intFromEnum(s.kind)].pt) return;
+        if (p.payload_type != pc.tracks[@backingInt(s.kind)].pt) return;
         // Statistics (RFC 3550 A.3, A.8).
         const ext = if (s.base_seq == null) @as(u64, p.seq) + 0x10000 else rtp.extendSeq(s.max_seq, p.seq);
         if (s.base_seq == null) {

@@ -45,7 +45,7 @@ pub const AnnexBIterator = struct {
 };
 
 pub fn nalType(nal: []const u8) NalType {
-    return @enumFromInt(@as(u5, @truncate(nal[0])));
+    return @fromBackingInt(@intCast(@as(u5, @truncate(nal[0]))));
 }
 
 /// True if the access unit contains an IDR slice.

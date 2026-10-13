@@ -61,7 +61,7 @@ pub const Builder = struct {
         if (b.len + total > b.buf.len) return error.NoSpaceLeft;
         const out = b.buf[b.len..][0..total];
         out[0] = 0x80 | @as(u8, count);
-        out[1] = @intFromEnum(pt);
+        out[1] = @backingInt(pt);
         std.mem.writeInt(u16, out[2..4], @intCast(words_after), .big);
         b.len += total;
         return out;
@@ -253,8 +253,8 @@ pub const Iterator = struct {
         if (len > h.len) return null;
         it.pos += len;
         var body = h[4..len];
-        if (h[0] & 0x20 != 0 and body.len > 0) body = body[0 .. body.len -| body[body.len - 1]];
-        return .{ .type = @enumFromInt(h[1]), .count = @truncate(h[0]), .body = body };
+        if (h[0] & 0x20 != 0 and body.len > 0) body = body[0..body.len -| body[body.len - 1]];
+        return .{ .type = @fromBackingInt(@intCast(h[1])), .count = @truncate(h[0]), .body = body };
     }
 };
 

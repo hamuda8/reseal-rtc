@@ -598,7 +598,7 @@ fn sendClientHello(c: *Conn) !void {
         try w.int(u16, hs.ext.use_srtp);
         try w.begin(2);
         try w.begin(2);
-        for (c.config.srtp_profiles) |p| try w.int(u16, @intFromEnum(p));
+        for (c.config.srtp_profiles) |p| try w.int(u16, @backingInt(p));
         w.end();
         try w.vec(1, ""); // no MKI
         w.end();
@@ -622,7 +622,7 @@ fn handleClientHello(c: *Conn, m: hs.Message, body: []const u8) !void {
     if (!h.offersSuite(hs.cipher_ecdhe_ecdsa_aes128_gcm_sha256)) return error.UnsupportedCipherSuite;
     // Pick our most preferred SRTP profile that the client offers.
     for (c.config.srtp_profiles) |p| {
-        if (hs.listHas(h.extensions.srtp_profiles, @intFromEnum(p))) {
+        if (hs.listHas(h.extensions.srtp_profiles, @backingInt(p))) {
             c.srtp_profile = p;
             break;
         }
@@ -660,7 +660,7 @@ fn handleClientHello(c: *Conn, m: hs.Message, body: []const u8) !void {
         try w.int(u16, hs.ext.use_srtp);
         try w.begin(2);
         try w.begin(2);
-        try w.int(u16, @intFromEnum(c.srtp_profile.?));
+        try w.int(u16, @backingInt(c.srtp_profile.?));
         w.end();
         try w.vec(1, "");
         w.end();

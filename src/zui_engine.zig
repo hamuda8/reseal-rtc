@@ -483,3 +483,24 @@ test "two engines: glare resolved by perfect negotiation, media, ICE restart" {
     defer sides[1].spin.unlock();
     try testing.expect(sides[1].audio >= before + 4);
 }
+
+test "polite engine with its own offer out answers a browser's colliding offer" {
+    const gpa = testing.allocator;
+    var side: Side = .{};
+    defer side.deinit();
+    const lo = [_]net.Address{net.Address.ip4(.{ 127, 0, 0, 1 }, 0)};
+    const p = try open(gpa, .{ .polite = true, .bind = &lo }, side.sink());
+    defer close(p);
+    const sdp = @import("sdp/sdp.zig");
+    const json = try std.json.Stringify.valueAlloc(gpa, .{ .description = .{ .type = "offer", .sdp = sdp.chrome_offer } }, .{});
+    defer gpa.free(json);
+    signal(p, json);
+    const msgs = side.take();
+    defer {
+        for (msgs) |m| gpa.free(m);
+        gpa.free(msgs);
+    }
+    var answered = false;
+    for (msgs) |m| answered = answered or std.mem.indexOf(u8, m, "\"type\":\"answer\"") != null;
+    try testing.expect(answered);
+}

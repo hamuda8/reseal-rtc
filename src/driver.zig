@@ -138,6 +138,7 @@ pub const Driver = struct {
     sockets: []UdpSocket,
     mutex: Io.Mutex = .init,
     group: Io.Group = .init,
+    stopping: std.atomic.Value(bool) = .init(false),
     /// Called with the lock held after every receive and poll: a place to act on what the
     /// handler saw (renegotiate, restart ICE) without re-entering the PeerConnection.
     on_tick: ?struct { ctx: *anyopaque, f: *const fn (ctx: *anyopaque) void } = null,
@@ -151,8 +152,20 @@ pub const Driver = struct {
         try d.group.concurrent(d.io, timerLoop, .{d});
     }
 
+    /// Stops the tasks and waits for them. Cooperative (a flag, and a datagram to each socket
+    /// to wake its receive) rather than cancellation: cancelling interrupts blocked calls with
+    /// SIGIO, which inside an Android app process is not caught and kills it.
     pub fn stop(d: *Driver) void {
-        d.group.cancel(d.io);
+        d.stopping.store(true, .release);
+        for (d.sockets) |*u| {
+            var to = u.local;
+            if (to.isUnspecified()) {
+                to = if (to.family == .ip4) net.Address.ip4(.{ 127, 0, 0, 1 }, to.port) else net.Address.ip6(.{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 }, to.port);
+            }
+            const dest = to.toStd();
+            u.sock.send(d.io, &dest, &.{0}) catch {};
+        }
+        d.group.await(d.io) catch {};
     }
 
     pub fn lock(d: *Driver) void {
@@ -165,12 +178,13 @@ pub const Driver = struct {
 
     fn receiveLoop(d: *Driver, index: u8) Io.Cancelable!void {
         var buf: [2048]u8 = undefined;
-        while (true) {
+        while (!d.stopping.load(.acquire)) {
             const msg = d.sockets[index].sock.receive(d.io, &buf) catch |err| switch (err) {
                 error.Canceled => return error.Canceled,
                 // Windows reports ICMP port-unreachable as a reset on UDP sockets.
                 else => continue,
             };
+            if (d.stopping.load(.acquire)) return;
             try d.mutex.lock(d.io);
             defer d.mutex.unlock(d.io);
             d.pc.receive(index, net.Address.fromStd(msg.from), msg.data, nowMs(d.io));
@@ -179,7 +193,7 @@ pub const Driver = struct {
     }
 
     fn timerLoop(d: *Driver) Io.Cancelable!void {
-        while (true) {
+        while (!d.stopping.load(.acquire)) {
             var wait_ms: u64 = 20;
             {
                 try d.mutex.lock(d.io);

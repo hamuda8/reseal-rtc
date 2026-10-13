@@ -126,6 +126,34 @@ const RemoteStream = struct {
 
 const Sent = struct { seq: u16, len: u16, data: [1300]u8 };
 
+const max_mlines = 8;
+
+fn SmallText(comptime n: usize) type {
+    return struct {
+        buf: [n]u8 = undefined,
+        len: usize = 0,
+
+        fn set(t: *@This(), s: []const u8) void {
+            t.len = @min(s.len, n);
+            @memcpy(t.buf[0..t.len], s[0..t.len]);
+        }
+
+        fn text(t: *const @This()) []const u8 {
+            return t.buf[0..t.len];
+        }
+    };
+}
+
+/// One m-line of the negotiated session: one of our tracks, or a rejected section we
+/// echo back with port 0 (so answers mirror offers line for line).
+const MLine = struct {
+    track: ?u1,
+    kind: SmallText(16) = .{},
+    mid: SmallText(32) = .{},
+    proto: SmallText(48) = .{},
+    formats: SmallText(96) = .{},
+};
+
 pub const Stats = struct {
     ice: IceState,
     connection: ConnectionState,
@@ -155,6 +183,9 @@ pub const PeerConnection = struct {
     session_id: u64,
     session_version: u32 = 2,
     cname: [16]u8,
+    mlines: [max_mlines]MLine = undefined,
+    mline_count: usize = 0,
+    answered_once: bool = false,
     tracks: [2]Track,
     local_candidates: std.ArrayList([]u8) = .empty,
     gathering_done: bool = false,
@@ -290,17 +321,30 @@ pub const PeerConnection = struct {
     pub fn createOffer(pc: *PeerConnection, gpa: std.mem.Allocator, now: u64) ![]u8 {
         pc.now = now;
         if (pc.signaling != .stable) return error.InvalidState;
-        pc.offerer = true;
-        pc.transport.ice.setRole(.controlling);
-        var mid: u8 = 0;
-        for (&pc.tracks) |*t| {
-            t.accepted = if (t.kind == .audio) pc.config.audio else pc.config.video;
-            if (!t.accepted) continue;
-            t.send = true;
-            t.recv = true;
-            var b: [4]u8 = undefined;
-            t.setMid(std.fmt.bufPrint(&b, "{d}", .{mid}) catch unreachable);
-            mid += 1;
+        const first = pc.mline_count == 0;
+        if (first) {
+            // Initial offer: we control ICE; one m-line per enabled kind.
+            pc.offerer = true;
+            pc.transport.ice.setRole(.controlling);
+            var mid: u8 = 0;
+            for (&pc.tracks, 0..) |*t, i| {
+                t.accepted = if (t.kind == .audio) pc.config.audio else pc.config.video;
+                if (!t.accepted) continue;
+                t.send = true;
+                t.recv = true;
+                var b: [4]u8 = undefined;
+                t.setMid(std.fmt.bufPrint(&b, "{d}", .{mid}) catch unreachable);
+                mid += 1;
+                pc.mlines[pc.mline_count] = .{ .track = @intCast(i) };
+                pc.mline_count += 1;
+            }
+        } else {
+            // Re-offer: same m-lines and mids; ICE and DTLS roles stay as negotiated.
+            pc.session_version += 1;
+            for (&pc.tracks) |*t| if (t.accepted) {
+                t.send = true;
+                t.recv = true;
+            };
         }
         pc.signaling = .have_local_offer;
         try pc.transport.ice.gather(now);
@@ -312,24 +356,35 @@ pub const PeerConnection = struct {
         pc.now = now;
         if (pc.signaling != .have_remote_offer) return error.InvalidState;
         pc.signaling = .stable;
+        if (pc.answered_once) pc.session_version += 1;
+        pc.answered_once = true;
         try pc.transport.ice.gather(now);
-        pc.transport.setDtlsRole(.client); // we answer setup:active
+        pc.transport.setDtlsRole(.client); // first answer: setup:active (no-op afterwards)
         return pc.localDescription(gpa);
     }
 
     /// The current local description, including candidates gathered so far.
     pub fn localDescription(pc: *PeerConnection, gpa: std.mem.Allocator) ![]u8 {
-        var media: [2]sdp.LocalMedia = undefined;
+        var media: [max_mlines]sdp.LocalMedia = undefined;
         var n: usize = 0;
         var fp_buf: [95]u8 = undefined;
         const audio_codec = [_]sdp.LocalCodec{.{ .pt = pc.tracks[0].pt, .name = "opus", .clock = opus.clock_rate, .channels = 2, .fmtp = opus.default_fmtp }};
         const video_codec = [_]sdp.LocalCodec{.{ .pt = pc.tracks[1].pt, .name = "H264", .clock = 90000, .fmtp = h264_fmtp, .feedback = &video_feedback }};
-        // Answers must keep the offer's m-line order.
-        var order = [2]usize{ 0, 1 };
-        if (pc.tracks[0].accepted and pc.tracks[1].accepted and std.mem.order(u8, pc.tracks[1].midText(), pc.tracks[0].midText()) == .lt) order = .{ 1, 0 };
-        for (order) |i| {
+        // m-lines in negotiated order (an answer mirrors the offer, rejected lines included).
+        for (pc.mlines[0..pc.mline_count]) |*ml| {
+            const i = ml.track orelse {
+                media[n] = .{
+                    .kind = ml.kind.text(),
+                    .mid = ml.mid.text(),
+                    .codecs = &.{},
+                    .rejected = true,
+                    .raw_proto = ml.proto.text(),
+                    .raw_formats = ml.formats.text(),
+                };
+                n += 1;
+                continue;
+            };
             const t = &pc.tracks[i];
-            if (!t.accepted and t.mid_len == 0) continue;
             const dir: sdp.Direction = if (t.send and t.recv) .sendrecv else if (t.send) .sendonly else if (t.recv) .recvonly else .inactive;
             media[n] = .{
                 .kind = if (t.kind == .audio) "audio" else "video",
@@ -357,7 +412,8 @@ pub const PeerConnection = struct {
             .ice_ufrag = pc.transport.ice.localUfrag(),
             .ice_pwd = pc.transport.ice.localPwd(),
             .fingerprint = certs.formatFingerprint(pc.cert.fingerprint, &fp_buf),
-            .setup = if (pc.offerer) .actpass else if (pc.transport.dtls) |d| (if (d.isClient()) .active else .passive) else .active,
+            // actpass only before the DTLS role is fixed; afterwards keep it (RFC 8842 5.3).
+            .setup = if (pc.transport.dtls) |d| (if (d.isClient()) .active else .passive) else if (pc.offerer) .actpass else .active,
             .media = media[0..n],
             .candidates = cands.items,
             .end_of_candidates = pc.gathering_done,
@@ -376,8 +432,11 @@ pub const PeerConnection = struct {
         switch (kind) {
             .offer => {
                 if (pc.signaling != .stable) return error.InvalidState;
-                pc.offerer = false;
-                pc.transport.ice.setRole(.controlled);
+                // Roles are fixed by the first exchange; a re-offer keeps them.
+                if (pc.transport.dtls == null) {
+                    pc.offerer = false;
+                    pc.transport.ice.setRole(.controlled);
+                }
                 try pc.acceptOffer(&s);
                 pc.signaling = .have_remote_offer;
             },
@@ -411,17 +470,34 @@ pub const PeerConnection = struct {
     }
 
     fn acceptOffer(pc: *PeerConnection, s: *const sdp.Session) !void {
+        if (s.media.len > max_mlines) return error.TooManyMediaSections;
         for (&pc.tracks) |*t| {
             t.accepted = false;
             t.mid_len = 0;
         }
+        pc.mline_count = 0;
         for (s.media) |*m| {
-            const kind: Kind = if (std.mem.eql(u8, m.kind, "audio")) .audio else if (std.mem.eql(u8, m.kind, "video")) .video else continue;
-            const t = &pc.tracks[@intFromEnum(kind)];
-            if (t.mid_len != 0) continue; // one track per kind
-            t.setMid(m.mid() orelse return error.MissingMid);
-            const enabled = if (kind == .audio) pc.config.audio else pc.config.video;
-            const pt = if (kind == .audio) findOpus(m) else findH264(m);
+            const mid = m.mid() orelse return error.MissingMid;
+            const kind: ?Kind = if (std.mem.eql(u8, m.kind, "audio")) .audio else if (std.mem.eql(u8, m.kind, "video")) .video else null;
+            // One track per kind; anything else (data channels, extra tracks) is rejected
+            // with a port-0 m-line so the answer still mirrors the offer.
+            if (kind == null or pc.tracks[@intFromEnum(kind.?)].mid_len != 0) {
+                var ml: MLine = .{ .track = null };
+                ml.kind.set(m.kind);
+                ml.mid.set(mid);
+                ml.proto.set(m.proto);
+                ml.formats.set(m.formats);
+                pc.mlines[pc.mline_count] = ml;
+                pc.mline_count += 1;
+                continue;
+            }
+            const t = &pc.tracks[@intFromEnum(kind.?)];
+            pc.mlines[pc.mline_count] = .{ .track = @intFromEnum(kind.?) };
+            pc.mline_count += 1;
+            t.setMid(mid);
+            const k = kind.?;
+            const enabled = if (k == .audio) pc.config.audio else pc.config.video;
+            const pt = if (k == .audio) findOpus(m) else findH264(m);
             if (!enabled or pt == null or m.port == 0) continue;
             t.accepted = true;
             t.pt = pt.?;
@@ -429,7 +505,7 @@ pub const PeerConnection = struct {
             t.send = dir == .sendrecv or dir == .recvonly;
             t.recv = dir == .sendrecv or dir == .sendonly;
             t.remote_nack = m.hasFeedback(t.pt, "nack");
-            try pc.noteRemoteSsrcs(kind, m);
+            try pc.noteRemoteSsrcs(k, m);
         }
     }
 

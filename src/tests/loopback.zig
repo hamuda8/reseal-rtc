@@ -182,3 +182,79 @@ test "loopback: AES-CM-80 profile" {
 test "loopback: 5% media loss recovered by NACK" {
     try run(20, &.{ .aead_aes128_gcm, .aes128_cm_sha1_80 });
 }
+
+fn noSend(_: *anyopaque, _: net.Address, _: []const u8) void {}
+
+test "answer to a Chrome offer: codec choice, setup, rejected data-channel m-line" {
+    const gpa = testing.allocator;
+    const sdp = @import("../sdp/sdp.zig");
+    var dummy: u8 = 0;
+    const sockets = [_]net.Socket{.{ .ctx = &dummy, .sendFn = noSend, .local = net.Address.ip4(.{ 192, 168, 1, 5 }, 50000) }};
+    var side: Side = .{ .gpa = gpa };
+    defer side.deinit();
+    const pc = try PeerConnection.create(gpa, testing.io, .{ .sockets = &sockets, .handler = .{ .ctx = &side, .onEvent = Side.onEvent } });
+    defer pc.destroy();
+    const offer = sdp.chrome_offer ++ "m=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:2\r\na=sctp-port:5000\r\n";
+    try pc.setRemoteDescription(.offer, offer, 0);
+    const answer = try pc.createAnswer(gpa, 0);
+    defer gpa.free(answer);
+    var s = try sdp.Session.parse(gpa, answer);
+    defer s.deinit();
+    try testing.expectEqual(@as(usize, 3), s.media.len);
+    try testing.expectEqualStrings("BUNDLE 0 1", s.attr("group").?);
+    try testing.expectEqualStrings("active", s.media[0].attr("setup").?);
+    try testing.expectEqualStrings("111", s.media[0].formats);
+    try testing.expectEqualStrings("106", s.media[1].formats); // constrained baseline, mode 1
+    try testing.expectEqual(@as(u16, 0), s.media[2].port);
+    try testing.expectEqualStrings("application", s.media[2].kind);
+    try testing.expectEqualStrings("2", s.media[2].mid().?);
+    try testing.expectEqualStrings("1000 1 udp 2130706431 192.168.1.5 50000 typ host generation 0", s.media[0].attr("candidate").?);
+}
+
+test "loopback: renegotiation keeps roles and media flowing" {
+    const gpa = testing.allocator;
+    var n: Net = .{ .gpa = gpa };
+    defer n.deinit();
+    var ports = [2]Net.Port{ .{ .n = &n, .idx = 0 }, .{ .n = &n, .idx = 1 } };
+    var sides = [2]Side{ .{ .gpa = gpa }, .{ .gpa = gpa } };
+    defer for (&sides) |*s| s.deinit();
+    var pcs: [2]*PeerConnection = undefined;
+    for (0..2) |i| {
+        const sockets = [_]net.Socket{.{ .ctx = &ports[i], .sendFn = Net.send, .local = Net.addrs[i] }};
+        pcs[i] = try PeerConnection.create(gpa, testing.io, .{ .sockets = &sockets, .handler = .{ .ctx = &sides[i], .onEvent = Side.onEvent } });
+    }
+    defer for (pcs) |pc| pc.destroy();
+    var now: u64 = 1000;
+    const offer = try pcs[0].createOffer(gpa, now);
+    defer gpa.free(offer);
+    try pcs[1].setRemoteDescription(.offer, offer, now);
+    const answer = try pcs[1].createAnswer(gpa, now);
+    defer gpa.free(answer);
+    try pcs[0].setRemoteDescription(.answer, answer, now);
+    while (now < 10_000 and !(sides[0].connected and sides[1].connected)) : (now += 5) pump(&n, pcs, now);
+    try testing.expect(sides[0].connected and sides[1].connected);
+
+    // Now the original answerer re-offers (as perfect negotiation does when a track is added).
+    const reoffer = try pcs[1].createOffer(gpa, now);
+    defer gpa.free(reoffer);
+    try testing.expect(std.mem.indexOf(u8, reoffer, "a=setup:active") != null); // not actpass
+    try pcs[0].setRemoteDescription(.offer, reoffer, now);
+    const reanswer = try pcs[0].createAnswer(gpa, now);
+    defer gpa.free(reanswer);
+    try testing.expect(std.mem.indexOf(u8, reanswer, "a=setup:passive") != null);
+    try pcs[1].setRemoteDescription(.answer, reanswer, now);
+
+    for (0..10) |_| {
+        try pcs[0].sendAudio(&.{ 0xF8, 0xFF, 0xFE });
+        for (0..4) |_| {
+            now += 5;
+            pump(&n, pcs, now);
+        }
+    }
+    for (0..40) |_| {
+        now += 5;
+        pump(&n, pcs, now);
+    }
+    try testing.expectEqual(@as(usize, 10), sides[1].audio.items.len);
+    try testing.expect(sides[0].connected and sides[1].connected);
+}

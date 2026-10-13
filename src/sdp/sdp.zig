@@ -279,6 +279,10 @@ pub const LocalMedia = struct {
     rtcp_rsize: bool = false,
     /// A rejected m-line in an answer (port 0).
     rejected: bool = false,
+    /// For rejecting non-RTP sections (e.g. "UDP/DTLS/SCTP" + "webrtc-datachannel"): echo
+    /// the offer's protocol and format list and write only the minimal lines.
+    raw_proto: ?[]const u8 = null,
+    raw_formats: []const u8 = "",
 };
 
 pub const Description = struct {
@@ -304,7 +308,12 @@ pub fn write(d: Description, w: *std.Io.Writer) std.Io.Writer.Error!void {
         break;
     };
     try w.writeAll("\r\n");
-    for (d.media, 0..) |m, mi| {
+    var candidates_written = false;
+    for (d.media) |m| {
+        if (m.raw_proto) |proto| {
+            try w.print("m={s} 0 {s} {s}\r\nc=IN IP4 0.0.0.0\r\na=mid:{s}\r\n", .{ m.kind, proto, m.raw_formats, m.mid });
+            continue;
+        }
         try w.print("m={s} {d} UDP/TLS/RTP/SAVPF", .{ m.kind, @as(u16, if (m.rejected) 0 else 9) });
         for (m.codecs) |c| try w.print(" {d}", .{c.pt});
         try w.writeAll("\r\nc=IN IP4 0.0.0.0\r\na=rtcp:9 IN IP4 0.0.0.0\r\n");
@@ -326,7 +335,8 @@ pub fn write(d: Description, w: *std.Io.Writer) std.Io.Writer.Error!void {
             try w.print("a=ssrc:{d} cname:{s}\r\n", .{ m.ssrc, m.cname });
             if (m.stream_id.len > 0) try w.print("a=ssrc:{d} msid:{s} {s}\r\n", .{ m.ssrc, m.stream_id, m.track_id });
         }
-        if (mi == 0) {
+        if (!m.rejected and !candidates_written) {
+            candidates_written = true;
             for (d.candidates) |c| try w.print("a={s}\r\n", .{c});
             if (d.end_of_candidates) try w.writeAll("a=end-of-candidates\r\n");
         }

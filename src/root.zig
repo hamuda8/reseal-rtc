@@ -52,6 +52,7 @@ test {
     _ = net;
     _ = driver;
     _ = zui_engine;
+    _ = @import("posix.zig");
     _ = stun;
     _ = candidate;
     _ = TurnClient;

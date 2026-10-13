@@ -19,7 +19,15 @@
 
 const std = @import("std");
 const peer_mod = @import("peer.zig");
+const builtin = @import("builtin");
 const driver = @import("driver.zig");
+const posix = @import("posix.zig");
+
+/// Phones (and other POSIX systems) run on BSD sockets and threads (posix.zig); Windows, where
+/// the tests run during development, on std.Io.Threaded (driver.zig).
+const use_posix = builtin.os.tag != .windows;
+const Udp = if (use_posix) posix.Udp else driver.UdpSocket;
+const Driver = if (use_posix) posix.Driver else driver.Driver;
 const net = @import("net.zig");
 const IceAgent = @import("ice/Agent.zig");
 
@@ -59,9 +67,9 @@ pub const Peer = struct {
     sink: Sink,
     polite: bool,
     pc: *PeerConnection = undefined,
-    udp: [max_sockets]driver.UdpSocket = undefined,
+    udp: [max_sockets]Udp = undefined,
     udp_count: usize = 0,
-    driver: driver.Driver = undefined,
+    driver: Driver = undefined,
     servers: []IceAgent.Server = &.{},
     /// Inside a negotiation call: candidates wait so they follow the description they belong to.
     negotiating: bool = false,
@@ -75,11 +83,24 @@ pub const Peer = struct {
     tracks_video: bool = false,
 };
 
+fn openUdp(io: Io, a: net.Address) !Udp {
+    return if (use_posix) Udp.open(a) else Udp.open(io, a);
+}
+
+fn nowMs(p: *const Peer) u64 {
+    return if (use_posix) posix.nowMs() else driver.nowMs(p.io);
+}
+
+fn sleepMs(ms: u64) void {
+    if (use_posix) posix.sleepMs(ms) else processIo().sleep(.fromMilliseconds(@intCast(ms)), .awake) catch {};
+}
+
 // One Io for every connection in the process, created on first use.
 var threaded: Io.Threaded = undefined;
 var threaded_ready = false;
 
 fn processIo() Io {
+    if (use_posix) return posix.io();
     if (!threaded_ready) {
         threaded = .init(std.heap.smp_allocator, .{});
         threaded_ready = true;
@@ -97,12 +118,12 @@ pub fn open(gpa: std.mem.Allocator, opts: Options, sink: Sink) !*Peer {
 
     if (opts.bind.len > 0) {
         for (opts.bind[0..@min(opts.bind.len, max_sockets)]) |a| {
-            p.udp[p.udp_count] = try driver.UdpSocket.open(io, a);
+            p.udp[p.udp_count] = try openUdp(io, a);
             p.udp_count += 1;
         }
     } else {
-        const local = driver.defaultLocalAddress(io, .ip4) orelse net.Address.ip4(.{ 0, 0, 0, 0 }, 0);
-        p.udp[0] = try driver.UdpSocket.open(io, local);
+        const found = if (use_posix) posix.defaultLocalAddress() else driver.defaultLocalAddress(io, .ip4);
+        p.udp[0] = try openUdp(io, found orelse net.Address.ip4(.{ 0, 0, 0, 0 }, 0));
         p.udp_count = 1;
     }
 
@@ -117,7 +138,7 @@ pub fn open(gpa: std.mem.Allocator, opts: Options, sink: Sink) !*Peer {
         .handler = .{ .ctx = p, .onEvent = onEvent },
     });
     errdefer p.pc.destroy();
-    p.driver = .init(io, p.pc, p.udp[0..p.udp_count]);
+    p.driver = if (use_posix) .init(p.pc, p.udp[0..p.udp_count]) else .init(io, p.pc, p.udp[0..p.udp_count]);
     p.driver.on_tick = .{ .ctx = p, .f = onTick };
 
     // Like the browser's negotiationneeded: offer right away.
@@ -148,7 +169,7 @@ pub fn signal(p: *Peer, json: []const u8) void {
     defer parsed.deinit();
     p.driver.lock();
     defer p.driver.unlock();
-    const now = driver.nowMs(p.io);
+    const now = nowMs(p);
     if (parsed.value.description) |d| {
         if (std.mem.eql(u8, d.type, "offer")) {
             const collision = !p.pc.isStable();
@@ -209,7 +230,7 @@ pub fn restartIce(p: *Peer) void {
 fn offer(p: *Peer) void {
     p.negotiating = true;
     defer endNegotiation(p);
-    const sdp = p.pc.createOffer(p.gpa, driver.nowMs(p.io)) catch return;
+    const sdp = p.pc.createOffer(p.gpa, nowMs(p)) catch return;
     defer p.gpa.free(sdp);
     sendDescription(p, "offer", sdp);
 }
@@ -323,6 +344,7 @@ fn resolveServers(io: Io, gpa: std.mem.Allocator, json: []const u8) ![]IceAgent.
         try spans.append(gpa, .{ .start = start, .len = urls_storage.items.len - start, .user = user, .cred = cred });
     }
     for (spans.items) |s| try list.append(gpa, .{ .urls = urls_storage.items[s.start..][0..s.len], .username = s.user, .credential = s.cred });
+    if (use_posix) return posix.resolveIceServers(gpa, list.items);
     return driver.resolveIceServers(io, gpa, list.items);
 }
 
@@ -420,7 +442,7 @@ fn waitConnected(sides: *[2]Side, peers: [2]*Peer, ms: u32) !void {
         relay(&sides[0], peers[1]);
         relay(&sides[1], peers[0]);
         if (sides[0].isConnected() and sides[1].isConnected()) return;
-        try processIo().sleep(.fromMilliseconds(10), .awake);
+        sleepMs(10);
     }
     return error.NotConnected;
 }
@@ -446,9 +468,9 @@ test "two engines: glare resolved by perfect negotiation, media, ICE restart" {
         sendAudio(a, &.{ 0xF8, 0xFF, 0xFE });
         sendAudio(b, &.{ 0xF8, 0xFF, 0xFE });
         sendVideo(a, &key, @intCast(i * 3000), 90);
-        try processIo().sleep(.fromMilliseconds(20), .awake);
+        sleepMs(20);
     }
-    try processIo().sleep(.fromMilliseconds(400), .awake);
+    sleepMs(400);
     sides[1].spin.lock();
     const got_audio = sides[1].audio;
     const got_video = sides[1].video;
@@ -463,7 +485,7 @@ test "two engines: glare resolved by perfect negotiation, media, ICE restart" {
     while (waited < 3000) : (waited += 10) {
         relay(&sides[0], b);
         relay(&sides[1], a);
-        try processIo().sleep(.fromMilliseconds(10), .awake);
+        sleepMs(10);
         a.driver.lock();
         const done = !std.mem.eql(u8, &old_ufrag, a.pc.iceUfrag()) and a.pc.transport.ice.selected != null and b.pc.transport.ice.selected != null;
         a.driver.unlock();
@@ -476,9 +498,9 @@ test "two engines: glare resolved by perfect negotiation, media, ICE restart" {
     sides[1].spin.unlock();
     for (0..5) |_| {
         sendAudio(a, &.{ 0xF8, 0xFF, 0xFE });
-        try processIo().sleep(.fromMilliseconds(20), .awake);
+        sleepMs(20);
     }
-    try processIo().sleep(.fromMilliseconds(300), .awake);
+    sleepMs(300);
     sides[1].spin.lock();
     defer sides[1].spin.unlock();
     try testing.expect(sides[1].audio >= before + 4);

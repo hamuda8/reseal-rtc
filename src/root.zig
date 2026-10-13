@@ -38,6 +38,7 @@ test {
     _ = peer;
     _ = driver;
     _ = @import("tests/loopback.zig");
+    _ = @import("tests/relay.zig");
     _ = srtp;
     _ = rtp;
     _ = rtcp;

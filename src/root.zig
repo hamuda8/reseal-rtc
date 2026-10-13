@@ -43,6 +43,7 @@ pub const rtcp = @import("media/rtcp.zig");
 pub const h264 = @import("media/h264.zig");
 pub const opus = @import("media/opus.zig");
 pub const JitterBuffer = @import("media/JitterBuffer.zig");
+pub const BitrateController = @import("media/BitrateController.zig");
 
 pub const sdp = @import("sdp/sdp.zig");
 pub const data = @import("data/data.zig");
@@ -70,6 +71,7 @@ test {
     _ = h264;
     _ = opus;
     _ = JitterBuffer;
+    _ = BitrateController;
     _ = sdp;
     _ = data;
     _ = @import("tests/loopback.zig");

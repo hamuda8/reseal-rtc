@@ -49,7 +49,13 @@ pub const Sink = struct {
     video: *const fn (ctx: *anyopaque, annexb: []const u8, keyframe: bool, rotation: u16) void,
     /// The other side wants a keyframe from our encoder.
     keyframe: *const fn (ctx: *anyopaque) void,
+    /// The bitrate our video encoder should use now (bits per second), from the other side's
+    /// reports: loss, round-trip time and its bandwidth estimate. Optional.
+    bitrate: ?*const fn (ctx: *anyopaque, bps: u32) void = null,
 };
+
+/// Tests only: drop this percentage of outgoing video packets, to watch adaptation work.
+pub var test_drop_video_percent: u8 = 0;
 
 pub const Options = struct {
     /// RTCPeerConnection's iceServers JSON: [{"urls":[...],"username":"","credential":""}].
@@ -207,6 +213,7 @@ pub fn sendVideo(p: *Peer, annexb: []const u8, timestamp_90k: u32, rotation: u16
     p.driver.lock();
     defer p.driver.unlock();
     p.pc.setVideoRotation(rotation);
+    p.pc.debug_drop_video_percent = test_drop_video_percent;
     p.pc.sendVideo(annexb, timestamp_90k) catch {};
 }
 
@@ -315,6 +322,7 @@ fn onEvent(ctx: *anyopaque, e: peer_mod.Event) void {
         .audio_frame => |f| p.sink.audio(p.sink.ctx, f.data),
         .video_frame => |f| p.sink.video(p.sink.ctx, f.data, f.keyframe, f.rotation),
         .keyframe_requested => p.sink.keyframe(p.sink.ctx),
+        .send_bitrate => |b| if (p.sink.bitrate) |f| f(p.sink.ctx, b.bps),
         .gathering_done, .remote_bitrate => {},
     }
 }

@@ -21,6 +21,7 @@ const rtcp = @import("media/rtcp.zig");
 const h264 = @import("media/h264.zig");
 const opus = @import("media/opus.zig");
 const JitterBuffer = @import("media/JitterBuffer.zig");
+const BitrateController = @import("media/BitrateController.zig");
 const sdp = @import("sdp/sdp.zig");
 
 pub const Kind = enum { audio, video };
@@ -44,6 +45,9 @@ pub const Event = union(enum) {
     keyframe_requested,
     /// The peer's receive-side bandwidth estimate for our video (REMB), bits per second.
     remote_bitrate: u64,
+    /// The bitrate our video encoder should use now (REMB, loss and RTT combined), with the
+    /// loss and round-trip time behind it. Sent when it changes by 5 % or more.
+    send_bitrate: struct { bps: u32, loss: f32, rtt_ms: u32 },
 };
 
 pub const Handler = struct {
@@ -63,6 +67,8 @@ pub const Config = struct {
     srtp_profiles: []const srtp.Profile = &.{ .aead_aes128_gcm, .aes128_cm_sha1_80 },
     /// Advertised to the sender with REMB.
     max_video_bitrate: u64 = 2_500_000,
+    /// Our video's send bitrate range (see `Event.send_bitrate`).
+    send_bitrate: BitrateController.Config = .{},
     audio_jitter_ms: u64 = 80,
     video_jitter_ms: u64 = 250,
     handler: Handler,
@@ -75,6 +81,9 @@ const h264_pt_default = 102;
 /// RTP header extension for the picture's rotation (3GPP TS 26.114, "CVO").
 const cvo_uri = "urn:3gpp:video-orientation";
 const cvo_default_id = 13;
+/// Send time on every video packet: what the receiver's REMB estimator needs.
+const abs_send_time_uri = "http://www.webrtc.org/experiments/rtp-hdrext/abs-send-time";
+const abs_send_time_default_id = 2;
 const h264_fmtp = "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f";
 const video_feedback = [_][]const u8{ "goog-remb", "ccm fir", "nack", "nack pli" };
 const max_rtp_payload = 1200 - 12 - 16; // datagram budget minus RTP header and SRTP tag
@@ -99,6 +108,7 @@ const Track = struct {
     remote_nack: bool = false,
     /// Negotiated id of the video-orientation extension (0: not negotiated).
     cvo_id: u8 = 0,
+    abs_id: u8 = 0,
 
     fn midText(t: *const Track) []const u8 {
         return t.mid[0..t.mid_len];
@@ -213,6 +223,15 @@ pub const PeerConnection = struct {
     video_rotation: u16 = 0,
     /// `restartIce` was called: the next offer carries new ICE credentials.
     restart_pending: bool = false,
+    bitrate: BitrateController = undefined,
+    emitted_bitrate: u32 = 0,
+    /// Tests only: drop this percentage of our outgoing video packets (to see adaptation).
+    debug_drop_video_percent: u8 = 0,
+    drop_counter: u32 = 0,
+    /// Video packets sent and NACKed since the last report: retransmissions hide loss from
+    /// receiver reports, NACKs do not.
+    sent_window: u32 = 0,
+    nacked_window: u32 = 0,
 
     pub fn create(gpa: std.mem.Allocator, io: std.Io, config: Config) !*PeerConnection {
         const pc = try gpa.create(PeerConnection);
@@ -235,6 +254,7 @@ pub const PeerConnection = struct {
         };
         errdefer gpa.free(pc.history);
         for (pc.history) |*h| h.len = 0;
+        pc.bitrate = .init(config.send_bitrate);
         const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
         io.random(&pc.cname);
         for (&pc.cname) |*c| c.* = alphabet[c.* % alphabet.len];
@@ -324,6 +344,45 @@ pub const PeerConnection = struct {
         pc.srtp_recv = ctxs.recv;
         std.crypto.secureZero(u8, &material);
         pc.next_rtcp_at = pc.now + 500;
+        pc.emitBitrate(true);
+    }
+
+    fn dropForTest(pc: *PeerConnection) bool {
+        if (pc.debug_drop_video_percent == 0) return false;
+        pc.drop_counter +%= 1;
+        return ((pc.drop_counter *% 2654435761) >> 8) % 100 < pc.debug_drop_video_percent;
+    }
+
+    fn emitBitrate(pc: *PeerConnection, force: bool) void {
+        const bps = pc.bitrate.current(pc.now);
+        const last: u64 = pc.emitted_bitrate;
+        if (!force and last != 0 and @as(u64, bps) * 20 > last * 19 and @as(u64, bps) * 20 < last * 21) return;
+        pc.emitted_bitrate = bps;
+        pc.emit(.{ .send_bitrate = .{ .bps = bps, .loss = pc.bitrate.loss, .rtt_ms = pc.bitrate.rtt_ms orelse 0 } });
+    }
+
+    /// Report blocks about our video (in SR or RR): loss and RTT into the bitrate controller.
+    fn onReportBlocks(pc: *PeerConnection, p: rtcp.Packet) void {
+        var i: usize = 0;
+        while (p.reportBlock(i)) |blk| : (i += 1) {
+            if (blk.ssrc != pc.tracks[1].local_ssrc) continue;
+            var rtt: ?u32 = null;
+            if (blk.last_sr != 0) {
+                const unix_ms: u64 = @intCast(@divTrunc(std.Io.Timestamp.now(pc.io, .real).nanoseconds, std.time.ns_per_ms));
+                const now_mid: u32 = @truncate(rtcp.ntpFromUnixMs(unix_ms) >> 16);
+                const units = now_mid -% blk.last_sr -% blk.delay_since_last_sr;
+                if (units < 65536 * 10) rtt = @intCast(@as(u64, units) * 1000 / 65536);
+            }
+            var fraction: u8 = blk.fraction_lost;
+            if (pc.sent_window >= 20) {
+                const nacked: u8 = @intCast(@min(255, @as(u64, pc.nacked_window) * 256 / pc.sent_window));
+                fraction = @max(fraction, nacked);
+            }
+            pc.sent_window = 0;
+            pc.nacked_window = 0;
+            pc.bitrate.onReport(pc.now, fraction, rtt);
+            pc.emitBitrate(false);
+        }
     }
 
     // ---- offer / answer ------------------------------------------------------------------
@@ -351,6 +410,7 @@ pub const PeerConnection = struct {
                 pc.mline_count += 1;
             }
             pc.tracks[1].cvo_id = cvo_default_id;
+            pc.tracks[1].abs_id = abs_send_time_default_id;
         } else {
             // Re-offer: same m-lines and mids; ICE and DTLS roles stay as negotiated.
             pc.session_version += 1;
@@ -386,7 +446,16 @@ pub const PeerConnection = struct {
         var n: usize = 0;
         var fp_buf: [95]u8 = undefined;
         const audio_codec = [_]sdp.LocalCodec{.{ .pt = pc.tracks[0].pt, .name = "opus", .clock = opus.clock_rate, .channels = 2, .fmtp = opus.default_fmtp }};
-        const cvo_ext = [_]sdp.Extmap{.{ .id = pc.tracks[1].cvo_id, .uri = cvo_uri }};
+        var video_ext: [2]sdp.Extmap = undefined;
+        var video_ext_n: usize = 0;
+        if (pc.tracks[1].abs_id != 0) {
+            video_ext[video_ext_n] = .{ .id = pc.tracks[1].abs_id, .uri = abs_send_time_uri };
+            video_ext_n += 1;
+        }
+        if (pc.tracks[1].cvo_id != 0) {
+            video_ext[video_ext_n] = .{ .id = pc.tracks[1].cvo_id, .uri = cvo_uri };
+            video_ext_n += 1;
+        }
         const video_codec = [_]sdp.LocalCodec{.{ .pt = pc.tracks[1].pt, .name = "H264", .clock = 90000, .fmtp = h264_fmtp, .feedback = &video_feedback }};
         // m-lines in negotiated order (an answer mirrors the offer, rejected lines included).
         for (pc.mlines[0..pc.mline_count]) |*ml| {
@@ -414,7 +483,7 @@ pub const PeerConnection = struct {
                 .stream_id = "reseal",
                 .track_id = if (t.kind == .audio) "audio0" else "video0",
                 .rtcp_rsize = t.kind == .video,
-                .extmaps = if (t.kind == .video and t.cvo_id != 0) &cvo_ext else &.{},
+                .extmaps = if (t.kind == .video) video_ext[0..video_ext_n] else &.{},
                 .rejected = !t.accepted,
             };
             n += 1;
@@ -526,7 +595,10 @@ pub const PeerConnection = struct {
             t.send = dir == .sendrecv or dir == .recvonly;
             t.recv = dir == .sendrecv or dir == .sendonly;
             t.remote_nack = m.hasFeedback(t.pt, "nack");
-            if (k == .video) t.cvo_id = m.extmapId(cvo_uri) orelse 0;
+            if (k == .video) {
+                t.cvo_id = m.extmapId(cvo_uri) orelse 0;
+                t.abs_id = m.extmapId(abs_send_time_uri) orelse 0;
+            }
             try pc.noteRemoteSsrcs(k, m);
         }
     }
@@ -553,7 +625,10 @@ pub const PeerConnection = struct {
             t.send = dir == .sendrecv or dir == .recvonly;
             t.recv = dir == .sendrecv or dir == .sendonly;
             t.remote_nack = m.hasFeedback(t.pt, "nack");
-            if (t.kind == .video) t.cvo_id = m.extmapId(cvo_uri) orelse 0;
+            if (t.kind == .video) {
+                t.cvo_id = m.extmapId(cvo_uri) orelse 0;
+                t.abs_id = m.extmapId(abs_send_time_uri) orelse 0;
+            }
             try pc.noteRemoteSsrcs(t.kind, m);
         }
     }
@@ -733,10 +808,23 @@ pub const PeerConnection = struct {
     fn sendRtp(pc: *PeerConnection, t: *Track, payload: []const u8, ts: u32, marker: bool) !void {
         const ctx = &(pc.srtp_send orelse return error.NotConnected);
         var buf: [1500]u8 = undefined;
-        const n = if (t.kind == .video and t.cvo_id != 0 and marker)
-            try rtp.writeWithElement(&buf, marker, @intCast(t.pt), t.seq, ts, t.local_ssrc, @intCast(t.cvo_id), @intCast(pc.video_rotation / 90 % 4), payload)
-        else
-            try rtp.write(&buf, marker, @intCast(t.pt), t.seq, ts, t.local_ssrc, payload);
+        var elements: [2]rtp.Element = undefined;
+        var ne: usize = 0;
+        var abs: [3]u8 = undefined;
+        const cvo = [1]u8{@intCast(pc.video_rotation / 90 % 4)};
+        if (t.kind == .video) {
+            if (t.abs_id != 0) {
+                // 6.18 fixed-point seconds, 24 bits (only differences matter to the receiver).
+                std.mem.writeInt(u24, &abs, @truncate((pc.now << 18) / 1000), .big);
+                elements[ne] = .{ .id = @intCast(t.abs_id), .data = &abs };
+                ne += 1;
+            }
+            if (t.cvo_id != 0 and marker) {
+                elements[ne] = .{ .id = @intCast(t.cvo_id), .data = &cvo };
+                ne += 1;
+            }
+        }
+        const n = try rtp.writeWithElements(&buf, marker, @intCast(t.pt), t.seq, ts, t.local_ssrc, elements[0..ne], payload);
         const len = try ctx.protectRtp(&buf, n);
         if (t.kind == .video) {
             const h = &pc.history[pc.history_next];
@@ -745,7 +833,8 @@ pub const PeerConnection = struct {
             @memcpy(h.data[0..len], buf[0..len]);
             pc.history_next = (pc.history_next + 1) % history_len;
         }
-        pc.transport.sendMedia(buf[0..len]);
+        if (t.kind == .video) pc.sent_window += 1;
+        if (!(t.kind == .video and pc.dropForTest())) pc.transport.sendMedia(buf[0..len]);
         t.seq +%= 1;
         t.packets +%= 1;
         t.octets +%= @intCast(payload.len);
@@ -946,10 +1035,15 @@ pub const PeerConnection = struct {
                         s.last_sr_mid = @truncate(info.ntp >> 16);
                         s.last_sr_at = pc.now;
                     };
+                    pc.onReportBlocks(p);
                 },
+                .rr => pc.onReportBlocks(p),
                 .rtpfb => if (p.isNack() and p.mediaSsrc() == pc.tracks[1].local_ssrc) {
                     var lost: [128]u16 = undefined;
-                    for (p.nackList(&lost)) |seq| pc.retransmit(seq);
+                    for (p.nackList(&lost)) |seq| {
+                        pc.nacked_window += 1;
+                        pc.retransmit(seq);
+                    }
                 },
                 .psfb => {
                     if (p.isPli() and p.mediaSsrc() == pc.tracks[1].local_ssrc) pc.emit(.keyframe_requested);
@@ -957,6 +1051,8 @@ pub const PeerConnection = struct {
                     if (p.rembBitrate()) |rate| {
                         pc.remote_bitrate = rate;
                         pc.emit(.{ .remote_bitrate = rate });
+                        pc.bitrate.onRemb(pc.now, rate);
+                        pc.emitBitrate(false);
                     }
                 },
                 else => {},

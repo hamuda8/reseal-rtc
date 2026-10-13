@@ -50,6 +50,8 @@ const Side = struct {
     audio: std.ArrayList([]u8) = .empty,
     video: std.ArrayList([]u8) = .empty,
     keyframe_requests: u32 = 0,
+    bitrate: u32 = 0,
+    bitrate_min: u32 = std.math.maxInt(u32),
     connected: bool = false,
 
     fn onEvent(ctx: *anyopaque, e: peer.Event) void {
@@ -60,6 +62,10 @@ const Side = struct {
             .audio_frame => |f| s.audio.append(s.gpa, s.gpa.dupe(u8, f.data) catch unreachable) catch unreachable,
             .video_frame => |f| if (!f.corrupt) s.video.append(s.gpa, s.gpa.dupe(u8, f.data) catch unreachable) catch unreachable,
             .keyframe_requested => s.keyframe_requests += 1,
+            .send_bitrate => |b| {
+                s.bitrate = b.bps;
+                s.bitrate_min = @min(s.bitrate_min, b.bps);
+            },
             else => {},
         }
     }
@@ -257,4 +263,50 @@ test "loopback: renegotiation keeps roles and media flowing" {
     }
     try testing.expectEqual(@as(usize, 10), sides[1].audio.items.len);
     try testing.expect(sides[0].connected and sides[1].connected);
+}
+
+test "loopback: send bitrate falls under video loss and recovers" {
+    const gpa = testing.allocator;
+    var n: Net = .{ .gpa = gpa };
+    defer n.deinit();
+    var ports = [2]Net.Port{ .{ .n = &n, .idx = 0 }, .{ .n = &n, .idx = 1 } };
+    var sides = [2]Side{ .{ .gpa = gpa }, .{ .gpa = gpa } };
+    defer for (&sides) |*s| s.deinit();
+    var pcs: [2]*PeerConnection = undefined;
+    for (0..2) |i| {
+        const sockets = [_]net.Socket{.{ .ctx = &ports[i], .sendFn = Net.send, .local = Net.addrs[i] }};
+        pcs[i] = try PeerConnection.create(gpa, testing.io, .{ .sockets = &sockets, .handler = .{ .ctx = &sides[i], .onEvent = Side.onEvent } });
+    }
+    defer for (pcs) |pc| pc.destroy();
+    var now: u64 = 1000;
+    const offer = try pcs[0].createOffer(gpa, now);
+    defer gpa.free(offer);
+    try pcs[1].setRemoteDescription(.offer, offer, now);
+    const answer = try pcs[1].createAnswer(gpa, now);
+    defer gpa.free(answer);
+    try pcs[0].setRemoteDescription(.answer, answer, now);
+    while (now < 10_000 and !(sides[0].connected and sides[1].connected)) : (now += 5) pump(&n, pcs, now);
+    try testing.expectEqual(@as(u32, 600_000), sides[0].bitrate);
+
+    var frame_buf: [8000]u8 = undefined;
+    var ts: u32 = 0;
+    const phase = struct {
+        fn run(nn: *Net, p: [2]*PeerConnection, t: *u64, stamp: *u32, buf: []u8, seconds: u32) !void {
+            for (0..seconds * 10) |_| {
+                try p[0].sendVideo(testFrame(buf, 1, 3000), stamp.*);
+                stamp.* +%= 9000;
+                for (0..20) |_| {
+                    t.* += 5;
+                    pump(nn, p, t.*);
+                }
+            }
+        }
+    }.run;
+    pcs[0].debug_drop_video_percent = 20;
+    try phase(&n, pcs, &now, &ts, &frame_buf, 8);
+    const lossy = sides[0].bitrate;
+    try testing.expect(lossy < 450_000);
+    pcs[0].debug_drop_video_percent = 0;
+    try phase(&n, pcs, &now, &ts, &frame_buf, 20);
+    try testing.expect(sides[0].bitrate > lossy * 2);
 }

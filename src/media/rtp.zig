@@ -81,15 +81,35 @@ pub fn write(buf: []u8, marker: bool, pt: u7, seq: u16, timestamp: u32, ssrc: u3
     return 12 + payload.len;
 }
 
-/// Like `write`, plus a one-byte header extension (RFC 8285) carrying a single 1-byte element
-/// (used for the video orientation, urn:3gpp:video-orientation).
-pub fn writeWithElement(buf: []u8, marker: bool, pt: u7, seq: u16, timestamp: u32, ssrc: u32, id: u4, value: u8, payload: []const u8) !usize {
-    if (buf.len < 20 + payload.len) return error.NoSpaceLeft;
+/// One element of a one-byte header extension (RFC 8285): 1 to 16 bytes under an id 1..14.
+pub const Element = struct { id: u4, data: []const u8 };
+
+/// Like `write`, plus a one-byte header extension with `elements` (abs-send-time, video
+/// orientation...).
+pub fn writeWithElements(buf: []u8, marker: bool, pt: u7, seq: u16, timestamp: u32, ssrc: u32, elements: []const Element, payload: []const u8) !usize {
+    if (elements.len == 0) return write(buf, marker, pt, seq, timestamp, ssrc, payload);
+    var ext_len: usize = 0;
+    for (elements) |e| ext_len += 1 + e.data.len;
+    const words = (ext_len + 3) / 4;
+    const hl = 16 + 4 * words;
+    if (buf.len < hl + payload.len) return error.NoSpaceLeft;
     _ = try write(buf, marker, pt, seq, timestamp, ssrc, &.{});
     buf[0] |= 0x10;
-    buf[12..20].* = .{ 0xBE, 0xDE, 0, 1, @as(u8, id) << 4, value, 0, 0 };
-    @memcpy(buf[20..][0..payload.len], payload);
-    return 20 + payload.len;
+    buf[12..14].* = .{ 0xBE, 0xDE };
+    std.mem.writeInt(u16, buf[14..16], @intCast(words), .big);
+    var pos: usize = 16;
+    for (elements) |e| {
+        buf[pos] = (@as(u8, e.id) << 4) | @as(u8, @intCast(e.data.len - 1));
+        @memcpy(buf[pos + 1 ..][0..e.data.len], e.data);
+        pos += 1 + e.data.len;
+    }
+    @memset(buf[pos..hl], 0);
+    @memcpy(buf[hl..][0..payload.len], payload);
+    return hl + payload.len;
+}
+
+pub fn writeWithElement(buf: []u8, marker: bool, pt: u7, seq: u16, timestamp: u32, ssrc: u32, id: u4, value: u8, payload: []const u8) !usize {
+    return writeWithElements(buf, marker, pt, seq, timestamp, ssrc, &.{.{ .id = id, .data = &.{value} }}, payload);
 }
 
 /// RFC 5761 4: RTCP packet types 192..223 share the first byte range with RTP; tell them apart
@@ -132,6 +152,11 @@ test "one-byte extension element round trip" {
     const p = try Packet.parse(buf[0..n]);
     try std.testing.expectEqual(@as(u8, 1), p.extensionElement(13).?[0]);
     try std.testing.expectEqualStrings("frame", p.payload);
+    const m = try writeWithElements(&buf, false, 102, 10, 0, 7, &.{ .{ .id = 2, .data = &.{ 1, 2, 3 } }, .{ .id = 13, .data = &.{3} } }, "x");
+    const q = try Packet.parse(buf[0..m]);
+    try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3 }, q.extensionElement(2).?);
+    try std.testing.expectEqual(@as(u8, 3), q.extensionElement(13).?[0]);
+    try std.testing.expectEqualStrings("x", q.payload);
 }
 
 test "extend sequence across wrap" {
